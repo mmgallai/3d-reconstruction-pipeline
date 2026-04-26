@@ -1,0 +1,16 @@
+# Core numerical / image stack
+numpy
+pillow
+pillow-heif
+
+# PyTorch (CUDA build — install via the official command for your CUDA version)
+# https://pytorch.org/get-started/locally/
+torch
+torchvision
+
+# Depth Anything 3 dependencies
+xformers
+huggingface_hub
+
+# Report generation (optional)
+python-docx
