@@ -9,9 +9,10 @@ import struct
 FILES = {
     "Polycam":        r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\other apps\polycam.ply",
     "Ours_V4_pruned": r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v4_mvs_500k_pruned.ply",
-    "Ours_V5_pruned": r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v5_da3_pruned.ply",
-    "Ours_V6_full":   r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v6_da3.ply",
     "Ours_V6_pruned": r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v6_da3_pruned.ply",
+    "Ours_V7_pruned": r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v7_hybrid_pruned.ply",
+    "Ours_V8_full":   r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v8_hybrid.ply",
+    "Ours_V8_pruned": r"C:\Users\mgallai\Projects\3d_automated\reconstruction_project\output\splat_v8_hybrid_pruned.ply",
 }
 
 PLY_TO_NP = {

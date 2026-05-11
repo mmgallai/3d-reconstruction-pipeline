@@ -385,6 +385,7 @@ def main():
 
     if args.fuse_only:
         print("\n--fuse-only: loading existing depth maps, skipping DA3 inference ...")
+        n_with_mvc = 0
         for img_meta in images:
             stem       = Path(img_meta["name"]).stem
             depth_file = depth_dir / f"{stem}.npy"
@@ -396,6 +397,15 @@ def main():
             w2c    = _w2c_from_image(img_meta)
             depth_orig = np.load(depth_file).astype(np.float32) * scale_factor
             orig_H, orig_W = depth_orig.shape
+
+            # If a multi-view consistency mask exists from filter_depths_mvc.py,
+            # zero out the depth where it's False so back-projection drops them.
+            mvc_file = depth_file.with_suffix(".mvc.npy")
+            if mvc_file.exists():
+                mvc_mask = np.load(mvc_file)
+                if mvc_mask.shape == depth_orig.shape:
+                    depth_orig = depth_orig * mvc_mask.astype(np.float32)
+                    n_with_mvc += 1
 
             # max_depth filter is also in COLMAP scale now
             pts = _backproject_frame(depth_orig, None, K_orig, w2c,
@@ -418,7 +428,8 @@ def main():
 
             all_pts.append(pts)
             all_rgb.append(rgb)
-        print(f"  Loaded {len(all_pts)} frames")
+        print(f"  Loaded {len(all_pts)} frames"
+              + (f" ({n_with_mvc} with MVC mask)" if n_with_mvc else ""))
     else:
         print(f"\nLoading {args.model} ...")
         from depth_anything_3.api import DepthAnything3

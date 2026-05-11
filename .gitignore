@@ -44,3 +44,11 @@ C:Users*
 .idea/
 *.swp
 .DS_Store
+
+# === Added in V17: more output dirs / logs ===
+openmvs/
+runs/
+*.log
+reconstruct_v*.log
+reconstruct_v*.err.log
+.dn_splatter_patched_state

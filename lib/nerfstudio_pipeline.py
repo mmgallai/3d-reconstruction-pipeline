@@ -194,36 +194,11 @@ def train_nerfstudio_format(
     iters  = _C("NERF_MAX_ITERATIONS")
     scale  = _C("NERF_DOWNSCALE_FACTOR")
     logger.info(f"=== Nerfstudio Training ({method}, {iters} iters, {scale}x downscale) ===")
-    # dn-splatter uses depth + normal supervision from DA3 depth maps.
-    # depth_file_path per frame is already embedded in transforms.json.
-    # normal-supervision depth = derive normals from depth gradient (no extra model needed).
-    is_dn = method.startswith("dn_splatter") or method.startswith("ags_mesh")
-    if is_dn:
-        extra_model_args = (
-            f'  --pipeline.model.use-depth-loss True '
-            f'  --pipeline.model.depth-lambda 0.2 '
-            f'  --pipeline.model.use-normal-loss True '
-            f'  --pipeline.model.use-normal-tv-loss True '
-            f'  --pipeline.model.normal-supervision depth '
-            f'  --pipeline.model.cull-alpha-thresh 0.01 '
-        )
-        # --no-deps avoids downgrading nerfstudio/gsplat already in the image.
-        # natsort + geffnet are small runtime deps not in the base image.
-        install_cmd = (
-            'pip install --upgrade -q "setuptools>=61" "wheel" && '
-            'pip install -q --no-build-isolation --no-deps /workspace/dn-splatter && '
-            'pip install -q natsort geffnet rerun-sdk pytorch-lightning '
-            '  omnidata-tools vdbfusion PyMCubes && '
-        )
-    else:
-        extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
-        install_cmd = ''
-
+    extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
         f'-e TORCH_HOME=/workspace/torch_cache '
         f'{_C("DOCKER_NERFSTUDIO")} bash -c "'
-        f'{install_cmd}'
         f'yes | ns-train {method} '
         f'  --data /workspace/{data_rel} '
         f'  --output-dir /workspace/nerfstudio '

@@ -48,6 +48,10 @@ RUN pip install --no-cache-dir nerfstudio
 RUN pip install --no-cache-dir \
         git+https://github.com/nerfstudio-project/gsplat.git
 
+# NOTE: DN-Splatter is installed at training-time from /workspace/dn-splatter
+# (the local clone) by lib/nerfstudio_pipeline.py — this preserves any local
+# modifications to the dn-splatter source. See `is_dn` block in train_nerfstudio_format.
+
 # ── Cache torch hub models in /workspace/torch_cache so they persist ──────────
 # Without this, Docker downloads alexnet (~233 MB) fresh on every --rm run.
 ENV TORCH_HOME=/workspace/torch_cache

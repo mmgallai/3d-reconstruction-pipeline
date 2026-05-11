@@ -39,7 +39,7 @@ from pathlib import Path
 
 import config
 from lib import heic_converter, nerfstudio_pipeline, colmap_pipeline
-from lib import colmap_to_ns
+from lib import colmap_to_ns, openmvs_pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,7 +69,9 @@ def _next_version(out_dir: Path) -> int:
 
 def _version_tag(init_ply_rel) -> str:
     """Return a short descriptive tag for the actual init used."""
-    if init_ply_rel == "da3_init.ply":
+    if init_ply_rel == "hybrid_init.ply":
+        return "hybrid"
+    elif init_ply_rel == "da3_init.ply":
         return "da3"
     elif init_ply_rel == "fused.ply":
         return "mvs_full"
@@ -107,9 +109,33 @@ def parse_args():
     p.add_argument("--resume", action="store_true",
                    help="Resume the most recent interrupted training run from its last checkpoint.")
     p.add_argument("--no-mesh", action="store_true",
-                   help="Skip Poisson mesh export (splat only).")
+                   help="Skip nerfstudio Poisson mesh export (splat only).")
     p.add_argument("--no-splat", action="store_true",
                    help="Skip Gaussian splat export (mesh only).")
+    # ── OpenMVS textured-mesh path (parallel to 3DGS) ────────────────────────
+    p.add_argument("--openmvs-mesh", action="store_true", default=True,
+                   help="Run OpenMVS textured mesh in parallel to 3DGS (default ON).")
+    p.add_argument("--no-openmvs-mesh", dest="openmvs_mesh", action="store_false",
+                   help="Disable the OpenMVS textured-mesh path.")
+    p.add_argument("--refine-mesh", action="store_true", default=True,
+                   help="Enable RefineMesh — photometric refinement (~10 min). "
+                        "Part of the canonical V17 recipe — ON by default.")
+    p.add_argument("--no-refine-mesh", dest="refine_mesh", action="store_false",
+                   help="Disable RefineMesh photometric refinement (faster, "
+                        "lower geometric fidelity).")
+    p.add_argument("--no-lod", action="store_true",
+                   help="Skip LOD decimation (mid 500K / low 100K). Default: produce LODs.")
+    p.add_argument("--no-ao", action="store_true",
+                   help="Skip per-vertex ambient-occlusion bake. Default: bake AO on each LOD.")
+    # Experimental: Poisson reconstruction. Tested at depth 12 in V19/V20 — produced
+    # noisier surfaces and lower visual quality than the default Delaunay path despite
+    # higher polygon count. Kept for further experimentation but NOT recommended.
+    p.add_argument("--poisson-mesh", action="store_true",
+                   help="EXPERIMENTAL: use Open3D screened Poisson reconstruction "
+                        "instead of OpenMVS Delaunay graph-cut. V20 testing showed "
+                        "this produces noisier, hole-prone surfaces — prefer the default.")
+    p.add_argument("--poisson-depth", type=int, default=11,
+                   help="Poisson octree depth: 10≈1-3M verts, 11≈3-8M, 12≈8-20M (default 11).")
 
     # -- MVS quality ----------------------------------------------------------
     p.add_argument("--mvs-max-image-size", type=int, default=None,
@@ -296,11 +322,41 @@ def main():
             da3_bounds = _json.load(_f)
         logger.info(f"  DA3 scene bounds loaded from {da3_bounds_f}")
 
-    # Use DA3 init point cloud as primary Gaussian init if it exists and is better
-    if da3_init_ply.exists():
+    # ── 4b. Hybrid init (MVS + scale-aligned DA3) ─────────────────────────────
+    hybrid_init_ply = dense_dir / "hybrid_init.ply"
+    fused_sub_ply   = dense_dir / "fused_sub.ply"
+
+    # Build hybrid_init.ply if both source clouds exist and the hybrid is older
+    # than either source (or missing entirely).
+    if fused_sub_ply.exists() and da3_init_ply.exists():
+        need_rebuild = (
+            not hybrid_init_ply.exists()
+            or hybrid_init_ply.stat().st_mtime < fused_sub_ply.stat().st_mtime
+            or hybrid_init_ply.stat().st_mtime < da3_init_ply.stat().st_mtime
+        )
+        if need_rebuild:
+            logger.info("--- Stage 4b: Building hybrid init (MVS + scale-aligned DA3) ---")
+            import subprocess as _sp3
+            _sp3.run([
+                "conda", "run", "-n", "da3", "python",
+                str(project_root / "generate_hybrid_init.py"),
+                "--mvs-ply",  str(fused_sub_ply),
+                "--da3-ply",  str(da3_init_ply),
+                "--output",   str(hybrid_init_ply),
+                "--target",   "750000",
+            ], check=True)
+        else:
+            logger.info("--- Stage 4b: Hybrid init (skipping — up to date) ---")
+
+    # Init priority: hybrid > DA3 > MVS_500k > sparse
+    if hybrid_init_ply.exists():
+        size_mb = hybrid_init_ply.stat().st_size / 1_048_576
+        logger.info(f"  Using HYBRID init cloud: {size_mb:.1f} MB → {hybrid_init_ply.name}")
+        init_ply_rel = "hybrid_init.ply"
+    elif da3_init_ply.exists():
         size_mb = da3_init_ply.stat().st_size / 1_048_576
         logger.info(f"  Using DA3 init cloud: {size_mb:.1f} MB → {da3_init_ply.name}")
-        init_ply_rel = "da3_init.ply"   # relative to dense_dir / transforms.json
+        init_ply_rel = "da3_init.ply"
 
     # ── 6. Generate transforms.json ───────────────────────────────────────────
     logger.info("--- Stage 5: Converting COLMAP model → transforms.json ---")
@@ -331,17 +387,45 @@ def main():
         logger.info("--- Stage 7: Resuming interrupted training ---")
         nerfstudio_pipeline.resume_training(project_root, data_rel=data_rel)
     else:
-        logger.info("--- Stage 7: Training (dn-splatter + DA3 depth supervision) ---")
+        logger.info(f"--- Stage 7: Training ({config.NERF_TRAIN_METHOD}, "
+                    f"init={init_ply_rel or 'random'}) ---")
         nerfstudio_pipeline.train_nerfstudio_format(
             project_root, data_rel=data_rel,
         )
 
-    # ── 9. Export mesh ────────────────────────────────────────────────────────
+    # ── 9. Export mesh (nerfstudio Poisson — usually fails on 3DGS) ───────────
     if not args.no_mesh:
-        logger.info("--- Stage 8: Exporting mesh (Poisson) ---")
+        logger.info("--- Stage 8: Exporting mesh from 3DGS (Poisson) ---")
         ok = nerfstudio_pipeline.export_mesh(project_root, method="poisson")
         if not ok:
-            logger.warning("Mesh export failed or not supported — skipping.")
+            logger.warning("3DGS Poisson mesh export failed (expected — 3DGS lacks "
+                           "surface normals). Use OpenMVS path instead (Stage 8b).")
+
+    # ── 9b. OpenMVS textured-mesh path (parallel to 3DGS) ─────────────────────
+    openmvs_mesh_path = None
+    if args.openmvs_mesh:
+        # Skip if already done for this dense workspace
+        existing_mesh = project_root / "openmvs" / "scene_textured.ply"
+        fused_ply     = dense_dir / "fused.ply"
+        if (existing_mesh.exists()
+                and fused_ply.exists()
+                and existing_mesh.stat().st_mtime > fused_ply.stat().st_mtime):
+            logger.info("--- Stage 8b: OpenMVS textured mesh (skipping — already up to date) ---")
+            openmvs_mesh_path = existing_mesh
+        else:
+            logger.info("--- Stage 8b: OpenMVS textured-mesh pipeline ---")
+            try:
+                openmvs_mesh_path = openmvs_pipeline.run_full_mesh_pipeline(
+                    project_root,
+                    colmap_dense_rel = "colmap/dense",
+                    pointcloud_rel   = None,  # use depth maps in scene.mvs (avoids SIGSEGV)
+                    do_refine        = args.refine_mesh,
+                    use_poisson      = args.poisson_mesh,
+                    poisson_depth    = args.poisson_depth,
+                )
+            except Exception as exc:
+                logger.warning(f"OpenMVS mesh pipeline raised: {exc}")
+                openmvs_mesh_path = None
 
     # ── 10. Export splat ──────────────────────────────────────────────────────
     if not args.no_splat:
@@ -374,7 +458,51 @@ def main():
             size_mb = dst.stat().st_size / 1_048_576
             logger.info(f"  {raw_name} → {versioned_name}  ({size_mb:.1f} MB)")
 
-    # Auto-run prune on the splat and save versioned pruned copy
+    # Copy versioned OpenMVS textured mesh (if produced this run).
+    # Mesh + its textures go into a per-version subdir so MeshLab can resolve
+    # the "comment TextureFile scene_textured*.png" entries in the .ply
+    # without renaming. Each version is self-contained and viewable in place.
+    if openmvs_mesh_path is not None and openmvs_mesh_path.exists():
+        mesh_subdir = out_dir / f"mesh_v{version}"
+        mesh_subdir.mkdir(parents=True, exist_ok=True)
+        omvs_dst = mesh_subdir / f"mesh_v{version}_openmvs.ply"
+        shutil.copy2(openmvs_mesh_path, omvs_dst)
+        size_mb = omvs_dst.stat().st_size / 1_048_576
+        logger.info(f"  OpenMVS mesh → {mesh_subdir.name}/{omvs_dst.name}  ({size_mb:.1f} MB)")
+        # Pick up .obj+.mtl if TextureMesh produced UV-mapped output
+        for ext in (".obj", ".mtl"):
+            src = openmvs_mesh_path.with_suffix(ext)
+            if src.exists():
+                shutil.copy2(src, mesh_subdir / f"mesh_v{version}_openmvs{ext}")
+        # Textures keep their original names (referenced by the .ply header)
+        for tex in openmvs_mesh_path.parent.glob("scene_textured*.png"):
+            shutil.copy2(tex, mesh_subdir / tex.name)
+
+        # Tier-3 polish: LOD decimation (mid/low) + per-vertex AO bake on HIGH
+        if not args.no_lod:
+            import subprocess as _sp
+            logger.info("--- Stage 10b: LOD decimation (mid 500K / low 100K) ---")
+            _sp.run(["conda", "run", "-n", "da3", "--no-capture-output",
+                     "python", str(project_root / "lib" / "mesh_lod.py"),
+                     str(omvs_dst), str(mesh_subdir),
+                     "--mid", "500000", "--low", "100000"], check=False)
+        if not args.no_ao:
+            import subprocess as _sp
+            logger.info("--- Stage 10c: Ambient-occlusion bake (HIGH/MID/LOW) ---")
+            for src, rays in [
+                (omvs_dst, 32),
+                (mesh_subdir / f"mesh_v{version}_openmvs_mid.ply", 64),
+                (mesh_subdir / f"mesh_v{version}_openmvs_low.ply", 64),
+            ]:
+                if src.exists():
+                    dst = src.with_name(src.stem + "_ao.ply")
+                    _sp.run(["conda", "run", "-n", "da3", "--no-capture-output",
+                             "python", str(project_root / "lib" / "mesh_ao_bake.py"),
+                             str(src), str(dst),
+                             "--rays", str(rays), "--max-dist", "0.5"], check=False)
+
+    # Auto-run prune on the splat and save versioned pruned copy.
+    # Three-stage filter: opacity + σ-outlier + connected-component.
     raw_splat = project_root / "output" / "splat.ply"
     if raw_splat.exists():
         pruned_name = f"splat_{label}_pruned.ply"
@@ -384,10 +512,12 @@ def main():
         subprocess.run(
             ["conda", "run", "-n", "da3", "python",
              str(project_root / "prune_splat.py"),
-             "--input",  str(raw_splat),
-             "--output", str(pruned_dst),
-             "--threshold", "0.15",
-             "--sigma-outlier", "5.0"],
+             "--input",         str(raw_splat),
+             "--output",        str(pruned_dst),
+             "--threshold",     "0.15",
+             "--sigma-outlier", "5.0",
+             "--cc-voxel",      "0.10",
+             "--cc-min-frac",   "0.005"],
             check=False,
         )
         if pruned_dst.exists():

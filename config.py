@@ -30,11 +30,12 @@ COLMAP_MAX_IMAGE_SIZE     = -1      # -1 = full resolution
 # ─────────────────────────────────────────────
 # Nerfstudio / Gaussian Splatting settings
 # ─────────────────────────────────────────────
-NERF_DOWNSCALE_FACTOR     = 2       # 1=full, 2=half, 4=quarter. 2 = good balance for rooms.
+NERF_DOWNSCALE_FACTOR     = 2       # 1=full, 2=half, 4=quarter.
+                                    # nerfstudio --downscale-factor accepts INT only;
+                                    # 1.5 needs separate engineering (rewrite transforms.json
+                                    # intrinsics + use images_1.5/ subdir + pass DS=1).
 NERF_MAX_ITERATIONS       = 30000   # 30000 for production, 1000 for quick test
-NERF_TRAIN_METHOD         = "splatfacto-big"  # V5: splatfacto-big + DA3 init + scene bounds.
-                                              # dn-splatter requires gsplat==1.0.0 — needs separate
-                                              # Docker image; tracked as V6 follow-up.
+NERF_TRAIN_METHOD         = "splatfacto-big"  # V14-V17: splatfacto-big + hybrid (MVS+DA3) init.
 
 # ─────────────────────────────────────────────
 # Mesh export settings
