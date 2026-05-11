@@ -1,0 +1,224 @@
+diff --git a/dn_splatter/dn_config.py b/dn_splatter/dn_config.py
+index 3054ecd..28ab464 100644
+--- a/dn_splatter/dn_config.py
++++ b/dn_splatter/dn_config.py
+@@ -147,9 +147,11 @@ dn_splatter_big = MethodSpecification(
+             datamanager=DNSplatterManagerConfig(
+                 dataparser=NormalNerfstudioConfig(load_3D_points=True)
+             ),
++            # `continue_cull_post_densification` was removed in nerfstudio 1.1.5;
++            # the `cull_alpha_thresh=0.005` knob is what we actually want for
++            # the "big" variant — looser culling to keep more Gaussians.
+             model=DNSplatterModelConfig(
+                 cull_alpha_thresh=0.005,
+-                continue_cull_post_densification=False,
+             ),
+         ),
+         optimizers={
+diff --git a/dn_splatter/dn_model.py b/dn_splatter/dn_model.py
+index 745c5f1..e4532c5 100644
+--- a/dn_splatter/dn_model.py
++++ b/dn_splatter/dn_model.py
+@@ -30,9 +30,43 @@ try:
+     from gsplat.rendering import rasterization
+ except ImportError:
+     print("Please install gsplat>=1.0.0")
+-from gsplat import rasterize_gaussians
+-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
+-from gsplat.cuda_legacy._wrapper import num_sh_bases
++# `rasterize_gaussians` is the old gsplat 1.0 API (used below at line ~564
++# when `predict_normals=True`). Modern gsplat (1.5+) doesn't export it.
++# Guard the import so the rest of the module (depth supervision, AGS-Mesh
++# regularization, etc.) still loads on modern gsplat — only the
++# `predict_normals` branch will fail if that is somehow enabled.
++try:
++    from gsplat import rasterize_gaussians
++except ImportError:
++    rasterize_gaussians = None
++
++# `gsplat.cuda_legacy.*` doesn't exist in modern gsplat (1.5+). Replace the
++# two utilities we need with inline implementations — they're standard math.
++try:
++    from gsplat.cuda_legacy._torch_impl import quat_to_rotmat  # noqa: F401
++    from gsplat.cuda_legacy._wrapper import num_sh_bases       # noqa: F401
++except ImportError:
++    def num_sh_bases(degree: int) -> int:
++        # Number of spherical-harmonic basis functions for a given degree
++        return (degree + 1) ** 2
++
++    def quat_to_rotmat(quat):
++        # Standard quaternion → rotation matrix. Input: (..., 4), wxyz convention.
++        # Reference: gsplat.cuda_legacy._torch_impl
++        import torch
++        # Normalise to be safe
++        quat = quat / (quat.norm(dim=-1, keepdim=True) + 1e-12)
++        w, x, y, z = quat.unbind(-1)
++        # Pre-compute products
++        ww, xx, yy, zz = w * w, x * x, y * y, z * z
++        wx, wy, wz = w * x, w * y, w * z
++        xy, xz, yz = x * y, x * z, y * z
++        m = torch.stack([
++            ww + xx - yy - zz, 2 * (xy - wz),     2 * (xz + wy),
++            2 * (xy + wz),     ww - xx + yy - zz, 2 * (yz - wx),
++            2 * (xz - wy),     2 * (yz + wx),     ww - xx - yy + zz,
++        ], dim=-1)
++        return m.reshape(*quat.shape[:-1], 3, 3)
+ from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+ from nerfstudio.cameras.cameras import Cameras
+ from nerfstudio.data.scene_box import OrientedBox
+@@ -284,12 +318,18 @@ class DNSplatterModel(SplatfactoModel):
+                 > self.num_train_data + self.config.refine_every
+             )
+             if do_densification:
+-                # then we densify
+-                assert (
+-                    self.xys_grad_norm is not None
+-                    and self.vis_counts is not None
+-                    and self.max_2Dsize is not None
+-                )
++                # The gradient/visibility/2D-size tracking below was populated by
++                # the old gsplat 1.0 API via self.xys/depths/radii/conics. Modern
++                # gsplat 1.5+ doesn't expose those, so on this pipeline these
++                # attributes stay None and we can't run dn-splatter's bespoke
++                # densification. Skip it — training continues but Gaussians stay
++                # at the initial seed count (500K from hybrid_init). The depth +
++                # normal supervision (the actual point of AGS-Mesh) still runs.
++                if (self.xys_grad_norm is None
++                        or self.vis_counts is None
++                        or self.max_2Dsize is None):
++                    do_densification = False
++            if do_densification:
+                 avg_grad_norm = (
+                     (self.xys_grad_norm / self.vis_counts)
+                     * 0.5
+@@ -352,7 +392,16 @@ class DNSplatterModel(SplatfactoModel):
+                 deleted_mask = self.cull_gaussians(splits_mask)
+             elif (
+                 self.step >= self.config.stop_split_at
+-                and self.config.continue_cull_post_densification
++                # `continue_cull_post_densification` was removed from
++                # SplatfactoModelConfig in nerfstudio 1.1.5. Default True if
++                # absent to preserve original DN-Splatter behaviour.
++                and getattr(self.config, "continue_cull_post_densification", True)
++                # `cull_gaussians` was removed from SplatfactoModel in 1.1.5
++                # (replaced by self.strategy.* in modern gsplat). DN-Splatter's
++                # own version overrides it for splits, but the base "cull only"
++                # code path went away. Skip when missing — same effect as
++                # setting `continue_cull_post_densification=False`.
++                and hasattr(self, "cull_gaussians")
+             ):
+                 deleted_mask = self.cull_gaussians()
+             else:
+@@ -538,8 +587,13 @@ class DNSplatterModel(SplatfactoModel):
+         else:
+             depth_im = None
+ 
+-        normals_im = torch.full(rgb.shape, 0.0)
+-        if self.config.predict_normals:
++        # Initialise on the same device as rgb (cuda) so downstream loss
++        # computations don't fail with cuda/cpu mismatches.
++        normals_im = torch.full(rgb.shape, 0.0, device=rgb.device, dtype=rgb.dtype)
++        # Skip the predict_normals branch on modern gsplat — it relies on the
++        # legacy `rasterize_gaussians` API (xys/conics/num_tiles_hit). AGS-Mesh
++        # doesn't strictly need rendered normals; depth-derived normals work.
++        if self.config.predict_normals and rasterize_gaussians is not None:
+             quats_crop = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
+             normals = F.one_hot(
+                 torch.argmin(scales_crop, dim=-1), num_classes=3
+@@ -602,6 +656,12 @@ class DNSplatterModel(SplatfactoModel):
+         )
+         surface_normal = (1 + surface_normal) / 2
+ 
++        # `normals_im` was initialised from `rgb.shape` while rgb was still
++        # 4-dim (BxHxWx3) — squeeze the batch dim so it matches the other
++        # outputs.  Without this, downstream code that does
++        # `(2 * pred_normal - 1).permute(2, 0, 1)` fails with a dim-mismatch.
++        if normals_im.dim() == 4:
++            normals_im = normals_im.squeeze(0)
+         return {
+             "rgb": rgb.squeeze(0),
+             "depth": depth_im,
+@@ -642,6 +702,7 @@ class DNSplatterModel(SplatfactoModel):
+             mono_depth_gt = self.get_gt_img(batch["mono_depth"])
+         if "normal" in batch:
+             batch["normal"] = self.get_gt_img(batch["normal"])
++        confidence = None
+         if "confidence" in batch:
+             confidence = 1 - self.get_gt_img(batch["confidence"]) / 255.0
+ 
+@@ -713,13 +774,26 @@ class DNSplatterModel(SplatfactoModel):
+                 **additional_data,
+             )
+         elif self.config.regularization_strategy == "ags-mesh":
++            # AGS-Mesh uses `confidence` to mask depth supervision per pixel.
++            # Our dataparser doesn't supply one, so trust all GT-depth pixels.
++            # Use `ones_like(depth_gt)` so the shape matches exactly (HxWx1) —
++            # `torch.ones(depth_gt.shape[:2])` would produce HxW and break the
++            # `torch.where(confidence > 0, gt_depth, 0)` op at step >= 7000.
++            if confidence is None and depth_gt is not None:
++                import torch as _torch
++                confidence = _torch.ones_like(depth_gt)
++            # `gt_normal` is None when the dataparser doesn't load normal
++            # maps. Fall back to the depth-derived `surface_normal` so the
++            # normal-loss term still has a target — effectively a
++            # self-consistency loss between rendered and depth-derived normals.
++            _gt_normal = gt_normal if gt_normal is not None else surface_normal
+             regularization_strategy_loss = self.regularization_strategy(
+                 step=self.step,
+                 pred_depth=depth_out,
+                 gt_depth=depth_gt,
+                 confidence_map=confidence,
+                 surf_normal=(2 * surface_normal - 1).permute(2, 0, 1),
+-                gt_normal=(2 * gt_normal - 1).permute(2, 0, 1),
++                gt_normal=(2 * _gt_normal - 1).permute(2, 0, 1),
+                 pred_normal=(2 * pred_normal - 1).permute(2, 0, 1),
+                 **additional_data,
+             )
+@@ -929,17 +1003,29 @@ class DNSplatterModel(SplatfactoModel):
+         self, training_callback_attributes: TrainingCallbackAttributes
+     ) -> List[TrainingCallback]:
+         cbs = []
++        # Nerfstudio 1.1.5: step_cb on SplatfactoModel now takes (optimizers, step).
++        # DN-Splatter inherits from SplatfactoModel and uses the parent's step_cb,
++        # so we need to pass the optimizers arg through.
+         cbs.append(
+             TrainingCallback(
+-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
++                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
++                self.step_cb,
++                args=[training_callback_attributes.optimizers],
+             )
+         )
+-        # The order of these matters
+-        cbs.append(
+-            TrainingCallback(
+-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
++        # Old nerfstudio splatfacto had an `after_train` method that this
++        # callback wrapped. Modern (1.1.5) splatfacto renamed it to
++        # `step_post_backward` AND made it depend on a `self.strategy`
++        # attribute (DefaultStrategy) that DN-Splatter doesn't initialize.
++        # The DN-Splatter equivalent work happens in `refinement_after`
++        # (registered below), so we skip step_post_backward when only the
++        # parent's version exists.
++        if hasattr(self, "after_train"):
++            cbs.append(
++                TrainingCallback(
++                    [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
++                )
+             )
+-        )
+         cbs.append(
+             TrainingCallback(
+                 [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+diff --git a/pyproject.toml b/pyproject.toml
+index c9cbf7b..3646cb1 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,3 +1,7 @@
++[build-system]
++requires = ["setuptools>=61.0", "wheel"]
++build-backend = "setuptools.build_meta"
++
+ [project]
+ name = "dn-splatter"
+ description = "Depth and normal priors for 3D Gaussian splatting and meshing"

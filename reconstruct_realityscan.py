@@ -112,6 +112,11 @@ def parse_args():
                    help="Skip nerfstudio Poisson mesh export (splat only).")
     p.add_argument("--no-splat", action="store_true",
                    help="Skip Gaussian splat export (mesh only).")
+    p.add_argument("--train-method", type=str, default=None,
+                   help="Override NERF_TRAIN_METHOD from config. Examples: "
+                        "splatfacto, splatfacto-big (default), dn-splatter, "
+                        "dn-splatter-big, ags-mesh. V22 used ags-mesh — first apply "
+                        "patches/dn_splatter_for_gsplat_15.patch to your dn-splatter/ clone.")
     # ── OpenMVS textured-mesh path (parallel to 3DGS) ────────────────────────
     p.add_argument("--openmvs-mesh", action="store_true", default=True,
                    help="Run OpenMVS textured mesh in parallel to 3DGS (default ON).")
@@ -167,6 +172,10 @@ def main():
     if not scan_dir.exists():
         logger.error(f"Scan directory not found: {scan_dir}")
         sys.exit(1)
+
+    if args.train_method:
+        config.NERF_TRAIN_METHOD = args.train_method
+        logger.info(f"Train method overridden: NERF_TRAIN_METHOD = {args.train_method}")
 
     if args.quick:
         config.NERF_MAX_ITERATIONS   = 1000

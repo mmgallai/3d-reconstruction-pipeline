@@ -194,11 +194,36 @@ def train_nerfstudio_format(
     iters  = _C("NERF_MAX_ITERATIONS")
     scale  = _C("NERF_DOWNSCALE_FACTOR")
     logger.info(f"=== Nerfstudio Training ({method}, {iters} iters, {scale}x downscale) ===")
-    extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
+    # V22: when training method is dn-splatter / ags-mesh, install the patched
+    # dn-splatter into the container at runtime (--no-deps preserves the
+    # nerfstudio/gsplat versions already in the image). Apply the source patches
+    # from patches/dn_splatter_for_gsplat_15.patch to your local dn-splatter/
+    # clone BEFORE running, otherwise the entry-point load fails on gsplat 1.5+.
+    is_dn = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    if is_dn:
+        extra_model_args = (
+            '  --pipeline.model.use-depth-loss True '
+            '  --pipeline.model.depth-lambda 0.2 '
+            '  --pipeline.model.use-normal-loss True '
+            '  --pipeline.model.use-normal-tv-loss True '
+            '  --pipeline.model.normal-supervision depth '
+            '  --pipeline.model.cull-alpha-thresh 0.01 '
+        )
+        install_cmd = (
+            "pip install --upgrade -q 'setuptools>=61' wheel && "
+            "pip install -q --no-build-isolation --no-deps --force-reinstall "
+            "  /workspace/dn-splatter && "
+            "pip install -q natsort geffnet rerun-sdk pytorch-lightning "
+            "  omnidata-tools vdbfusion PyMCubes && "
+        )
+    else:
+        extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
+        install_cmd = ""
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
         f'-e TORCH_HOME=/workspace/torch_cache '
         f'{_C("DOCKER_NERFSTUDIO")} bash -c "'
+        f'{install_cmd}'
         f'yes | ns-train {method} '
         f'  --data /workspace/{data_rel} '
         f'  --output-dir /workspace/nerfstudio '
