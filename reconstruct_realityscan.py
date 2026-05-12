@@ -117,6 +117,11 @@ def parse_args():
                         "splatfacto, splatfacto-big (default), dn-splatter, "
                         "dn-splatter-big, ags-mesh. V22 used ags-mesh — first apply "
                         "patches/dn_splatter_for_gsplat_15.patch to your dn-splatter/ clone.")
+    p.add_argument("--use-femto-depth", action="store_true",
+                   help="V23: Use Orbbec Femto Mega ToF depth (from "
+                        "nerfstudio_data/depths_femto/) instead of running DA3 "
+                        "monocular depth. Requires `capture_femto.py` run first. "
+                        "Builds tof_init.ply from back-projected depths + COLMAP poses.")
     # ── OpenMVS textured-mesh path (parallel to 3DGS) ────────────────────────
     p.add_argument("--openmvs-mesh", action="store_true", default=True,
                    help="Run OpenMVS textured mesh in parallel to 3DGS (default ON).")
@@ -198,14 +203,24 @@ def main():
         nerfstudio_pipeline.ensure_image(script_dir)
 
     # ── 2. HEIC → JPEG ────────────────────────────────────────────────────────
-    logger.info("--- Stage 1: Converting HEIC → JPEG ---")
-    converted = heic_converter.convert_directory(
-        scan_dir, jpeg_dir, quality=args.jpeg_quality,
-    )
-    if not converted:
-        logger.error("No JPEG images produced. Aborting.")
-        sys.exit(1)
-    logger.info(f"  {len(converted)} images in {jpeg_dir}")
+    # Femto Mega captures direct to JPEG via capture_femto.py, so we skip this
+    # stage when --use-femto-depth is on. The images are already in jpeg_dir.
+    if args.use_femto_depth:
+        existing_jpegs = list(jpeg_dir.glob("*.jpg")) + list(jpeg_dir.glob("*.jpeg"))
+        if not existing_jpegs:
+            logger.error(f"--use-femto-depth set but no JPEGs in {jpeg_dir}.\n"
+                         f"  Run `python capture_femto.py` first.")
+            sys.exit(1)
+        logger.info(f"--- Stage 1: HEIC→JPEG (skipping — using {len(existing_jpegs)} Femto JPEGs) ---")
+    else:
+        logger.info("--- Stage 1: Converting HEIC → JPEG ---")
+        converted = heic_converter.convert_directory(
+            scan_dir, jpeg_dir, quality=args.jpeg_quality,
+        )
+        if not converted:
+            logger.error("No JPEG images produced. Aborting.")
+            sys.exit(1)
+        logger.info(f"  {len(converted)} images in {jpeg_dir}")
 
     # ── 3. COLMAP SfM ─────────────────────────────────────────────────────────
     undistorted_images_dir = dense_dir / "images"
@@ -297,47 +312,81 @@ def main():
             else:
                 logger.warning("No sparse points exported — 2DGS will use random init.")
 
-    # ── 5. DA3 depth map generation ───────────────────────────────────────────
+    # ── 5. Depth map generation ───────────────────────────────────────────────
+    # Two sources: DA3 monocular (default), or Femto Mega ToF (--use-femto-depth).
+    # Femto gives TRUE metric depth — no scale alignment needed.
     depth_dir    = dense_dir / "depths"
     da3_init_ply = dense_dir / "da3_init.ply"
     da3_bounds_f = dense_dir / "da3_bounds.json"
+    tof_init_ply = dense_dir / "tof_init.ply"
+    tof_bounds_f = dense_dir / "tof_bounds.json"
     da3_bounds   = None
 
-    depth_maps_done = (
-        depth_dir.exists()
-        and len(list(depth_dir.glob("*.npy"))) >= n_frames if 'n_frames' in dir() else False
-        or (depth_dir.exists() and any(depth_dir.glob("*.npy")))
-    )
-
-    if depth_maps_done and da3_init_ply.exists():
-        logger.info("--- Stage 4: DA3 depth generation (skipping — already exists) ---")
+    if args.use_femto_depth:
+        # ── ToF init: back-project Femto depths + COLMAP poses → tof_init.ply ──
+        femto_depths = project_root / "nerfstudio_data" / "depths_femto"
+        if not femto_depths.exists() or not any(femto_depths.glob("*.npy")):
+            logger.error(f"--use-femto-depth set but no .npy files under {femto_depths}.\n"
+                         f"  Run `python capture_femto.py` first.")
+            sys.exit(1)
+        if tof_init_ply.exists():
+            logger.info("--- Stage 4: Femto ToF init (skipping — tof_init.ply already exists) ---")
+        else:
+            logger.info("--- Stage 4: Femto ToF init (back-project depths + COLMAP poses) ---")
+            import subprocess as _sp2
+            _sp2.run([
+                "conda", "run", "-n", "da3", "python",
+                str(project_root / "femto_to_init.py"),
+                "--project-root", str(project_root),
+                "--target",       "500000",
+                "--sigma-clip",   "3.0",
+                "--max-depth",    "5.3",
+                "--min-depth",    "0.30",
+            ], check=True)
+        if tof_bounds_f.exists():
+            import json as _json
+            with open(tof_bounds_f) as _f:
+                da3_bounds = _json.load(_f)
+            logger.info(f"  ToF scene bounds loaded from {tof_bounds_f}")
     else:
-        logger.info("--- Stage 4: DA3 depth generation (Depth Anything 3 Metric-Large) ---")
-        import subprocess as _sp2
-        _sp2.run([
-            "conda", "run", "-n", "da3", "python",
-            str(project_root / "generate_da3_depths.py"),
-            "--project-root", str(project_root),
-            "--target",       "500000",
-            "--sigma-clip",   "3.0",
-            "--max-depth",    "12.0",
-            "--batch-size",   "32",
-            "--model",        "da3metric-large",
-        ], check=True)
+        # ── DA3 monocular path (original V6 / V14 recipe) ──
+        depth_maps_done = (
+            depth_dir.exists()
+            and len(list(depth_dir.glob("*.npy"))) >= n_frames if 'n_frames' in dir() else False
+            or (depth_dir.exists() and any(depth_dir.glob("*.npy")))
+        )
 
-    if da3_bounds_f.exists():
-        import json as _json
-        with open(da3_bounds_f) as _f:
-            da3_bounds = _json.load(_f)
-        logger.info(f"  DA3 scene bounds loaded from {da3_bounds_f}")
+        if depth_maps_done and da3_init_ply.exists():
+            logger.info("--- Stage 4: DA3 depth generation (skipping — already exists) ---")
+        else:
+            logger.info("--- Stage 4: DA3 depth generation (Depth Anything 3 Metric-Large) ---")
+            import subprocess as _sp2
+            _sp2.run([
+                "conda", "run", "-n", "da3", "python",
+                str(project_root / "generate_da3_depths.py"),
+                "--project-root", str(project_root),
+                "--target",       "500000",
+                "--sigma-clip",   "3.0",
+                "--max-depth",    "12.0",
+                "--batch-size",   "32",
+                "--model",        "da3metric-large",
+            ], check=True)
+
+        if da3_bounds_f.exists():
+            import json as _json
+            with open(da3_bounds_f) as _f:
+                da3_bounds = _json.load(_f)
+            logger.info(f"  DA3 scene bounds loaded from {da3_bounds_f}")
 
     # ── 4b. Hybrid init (MVS + scale-aligned DA3) ─────────────────────────────
+    # Skipped when --use-femto-depth: ToF init is already metric and dense,
+    # no need to fuse with MVS.
     hybrid_init_ply = dense_dir / "hybrid_init.ply"
     fused_sub_ply   = dense_dir / "fused_sub.ply"
 
     # Build hybrid_init.ply if both source clouds exist and the hybrid is older
     # than either source (or missing entirely).
-    if fused_sub_ply.exists() and da3_init_ply.exists():
+    if (not args.use_femto_depth) and fused_sub_ply.exists() and da3_init_ply.exists():
         need_rebuild = (
             not hybrid_init_ply.exists()
             or hybrid_init_ply.stat().st_mtime < fused_sub_ply.stat().st_mtime
@@ -357,8 +406,12 @@ def main():
         else:
             logger.info("--- Stage 4b: Hybrid init (skipping — up to date) ---")
 
-    # Init priority: hybrid > DA3 > MVS_500k > sparse
-    if hybrid_init_ply.exists():
+    # Init priority: ToF (Femto) > hybrid > DA3 > MVS_500k > sparse
+    if args.use_femto_depth and tof_init_ply.exists():
+        size_mb = tof_init_ply.stat().st_size / 1_048_576
+        logger.info(f"  Using ToF init cloud (Femto Mega): {size_mb:.1f} MB → {tof_init_ply.name}")
+        init_ply_rel = "tof_init.ply"
+    elif hybrid_init_ply.exists():
         size_mb = hybrid_init_ply.stat().st_size / 1_048_576
         logger.info(f"  Using HYBRID init cloud: {size_mb:.1f} MB → {hybrid_init_ply.name}")
         init_ply_rel = "hybrid_init.ply"

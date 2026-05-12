@@ -52,3 +52,8 @@ runs/
 reconstruct_v*.log
 reconstruct_v*.err.log
 .dn_splatter_patched_state
+
+# === Added in V23 ===
+Log/
+colmap_iphone_backup/
+*.whl
