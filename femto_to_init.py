@@ -66,6 +66,17 @@ def _parse_args():
                    help="Drop depths beyond this (Femto spec: 5.46 m, default 5.3)")
     p.add_argument("--min-depth", type=float, default=0.30,
                    help="Drop depths closer than this (Femto spec: 0.25 m)")
+    # ── Hybrid ToF + DA3 fallback (fills <0.25 m and >5.3 m gaps) ────────────
+    p.add_argument("--use-da3-fallback", action="store_true",
+                   help="Fill out-of-ToF-range pixels with DA3 depths, per-frame "
+                        "linear-fit (α·d_da3 + β) anchored to ToF on overlap pixels.")
+    p.add_argument("--da3-depths-dir", default="colmap/dense/depths",
+                   help="Folder with DA3 .npy depth maps (from generate_da3_depths.py).")
+    p.add_argument("--da3-max-depth", type=float, default=12.0,
+                   help="Cap DA3-fill depths at this many metres (default 12).")
+    p.add_argument("--min-overlap", type=int, default=200,
+                   help="Min ToF/DA3 overlap pixels per frame to fit α,β. "
+                        "Below this, fall back to global DA3 scale (default 200).")
     return p.parse_args()
 
 
@@ -129,10 +140,50 @@ def main():
           f"std={scale_info['std']:.4f}")
     print(f"    → multiplying every Femto depth by {scale_factor:.4f} (COLMAP-scale)")
 
+    # ── Optional: solve DA3 scale + prepare per-frame fit ──────────────────
+    da3_depths_dir = root / args.da3_depths_dir
+    da3_scale = None
+    da3_info  = None
+    if args.use_da3_fallback:
+        if not da3_depths_dir.exists() or not any(da3_depths_dir.glob("*.npy")):
+            print(f"  ERROR: --use-da3-fallback set but no .npy in {da3_depths_dir}",
+                  file=sys.stderr)
+            return 5
+
+        def _da3_depth_loader(img_meta):
+            stem = Path(img_meta["name"]).stem
+            f = da3_depths_dir / f"{stem}.npy"
+            if not f.exists():
+                return None
+            d = np.load(f).astype(np.float32)
+            cam = cameras[img_meta["camera_id"]]
+            cam_h, cam_w = cam["height"], cam["width"]
+            if d.shape != (cam_h, cam_w):
+                if cv2 is None:
+                    return None
+                d = cv2.resize(d, (cam_w, cam_h), interpolation=cv2.INTER_NEAREST)
+            return d
+
+        print("  solving COLMAP↔DA3 scale factor (for global fallback) ...")
+        da3_scale, da3_info = g_da3.compute_global_scale(
+            images, cameras, points3d, _da3_depth_loader,
+        )
+        print(f"    pairs: {da3_info['n_pairs']:,} from {da3_info['n_images']} images")
+        print(f"    ratio (colmap/da3): median={da3_info['median']:.4f}  "
+              f"p25={da3_info['p25']:.4f}  p75={da3_info['p75']:.4f}")
+        # DA3-to-Femto-metric scale: if no overlap pixels in a frame, this maps
+        # DA3 metres → Femto-anchored metres so it goes through scale_factor cleanly.
+        da3_to_femto_metric = da3_scale / scale_factor
+        print(f"    global DA3→Femto-metric factor = {da3_to_femto_metric:.4f} "
+              f"({(da3_to_femto_metric-1)*100:+.1f}% vs ToF)")
+
     # ── Per-frame back-projection ──────────────────────────────────────────
     all_xyz = []
     all_rgb = []
     rng = np.random.default_rng(0)
+
+    # Per-frame fit diagnostics (only if DA3 fallback enabled)
+    fit_alphas, fit_betas, fit_overlaps, fit_fallbacks = [], [], [], 0
 
     # _read_images returns a list of dicts; _read_cameras returns a dict keyed by camera_id.
     for img in images:
@@ -171,8 +222,46 @@ def main():
             conf  = cv2.resize(conf.astype(np.uint8), (cam_w, cam_h),
                               interpolation=cv2.INTER_NEAREST).astype(bool)
 
-        # Range mask (in Femto-metric, BEFORE scale-up to COLMAP units)
-        valid = conf & (depth >= args.min_depth) & (depth <= args.max_depth)
+        # ToF range mask (in Femto-metric, BEFORE scale-up to COLMAP units)
+        tof_valid = conf & (depth >= args.min_depth) & (depth <= args.max_depth)
+
+        # ── Hybrid: build a per-pixel depth map combining ToF + DA3 fallback
+        if args.use_da3_fallback:
+            da3_path = da3_depths_dir / f"{stem}.npy"
+            if da3_path.exists():
+                da3 = np.load(da3_path).astype(np.float32)
+                if da3.shape != (cam_h, cam_w):
+                    da3 = cv2.resize(da3, (cam_w, cam_h),
+                                     interpolation=cv2.INTER_NEAREST)
+
+                # Per-frame fit: anchor DA3 to ToF using their overlap pixels
+                overlap = tof_valid & (da3 > 0.05)
+                if int(overlap.sum()) >= args.min_overlap:
+                    A = np.stack([da3[overlap], np.ones(overlap.sum())], axis=1)
+                    sol, *_ = np.linalg.lstsq(A, depth[overlap], rcond=None)
+                    alpha, beta = float(sol[0]), float(sol[1])
+                    da3_corrected = alpha * da3 + beta
+                    fit_alphas.append(alpha); fit_betas.append(beta)
+                    fit_overlaps.append(int(overlap.sum()))
+                else:
+                    # Not enough overlap — use global DA3→Femto-metric scale
+                    da3_corrected = da3 * da3_to_femto_metric
+                    fit_fallbacks += 1
+
+                # DA3 fills only where ToF is invalid AND the corrected DA3
+                # is sane (positive, within da3_max_depth).
+                da3_fill = (~tof_valid) & (da3_corrected > args.min_depth * 0.5) \
+                           & (da3_corrected <= args.da3_max_depth)
+
+                # Final per-pixel depth (Femto-metric)
+                depth = np.where(tof_valid, depth, 0.0)
+                depth = np.where(da3_fill, da3_corrected, depth)
+                valid = tof_valid | da3_fill
+            else:
+                valid = tof_valid
+        else:
+            valid = tof_valid
+
         if not valid.any():
             continue
 
@@ -220,6 +309,17 @@ def main():
     rgb = np.concatenate(all_rgb, axis=0)
     print(f"  fused: {len(xyz):,} world-space points from {len(all_xyz)} frame(s)")
 
+    if args.use_da3_fallback and fit_alphas:
+        a = np.array(fit_alphas); b = np.array(fit_betas)
+        ov = np.array(fit_overlaps)
+        print(f"  per-frame DA3→ToF fit  (n={len(a)} frames, "
+              f"{fit_fallbacks} global-scale fallback):")
+        print(f"    α  median={np.median(a):.3f}  p25={np.percentile(a,25):.3f}  "
+              f"p75={np.percentile(a,75):.3f}")
+        print(f"    β  median={np.median(b):.3f}  p25={np.percentile(b,25):.3f}  "
+              f"p75={np.percentile(b,75):.3f}  (metres)")
+        print(f"    overlap median={int(np.median(ov)):,} px / frame")
+
     # ── σ-clip outliers ────────────────────────────────────────────────────
     if args.sigma_clip > 0:
         c = xyz.mean(axis=0)
@@ -254,16 +354,28 @@ def main():
     bb_min = xyz.min(0).tolist()
     bb_max = xyz.max(0).tolist()
     bounds_js.parent.mkdir(parents=True, exist_ok=True)
-    bounds_js.write_text(json.dumps({
+    bounds_dict = {
         "x_min": bb_min[0], "x_max": bb_max[0],
         "y_min": bb_min[1], "y_max": bb_max[1],
         "z_min": bb_min[2], "z_max": bb_max[2],
-        "scale_factor_da3_to_colmap": float(scale_factor),
+        "scale_factor_da3_to_colmap": float(scale_factor),  # name kept for pipeline compat
         "scale_aligned": True,
         "scale_info": scale_info,
-        "source": "femto_mega_tof",
+        "source": ("femto_mega_tof+da3_fill" if args.use_da3_fallback else "femto_mega_tof"),
         "n_points": int(len(xyz)),
-    }, indent=2))
+    }
+    if args.use_da3_fallback:
+        bounds_dict["da3_scale_factor"] = float(da3_scale)
+        bounds_dict["da3_scale_info"]   = da3_info
+        if fit_alphas:
+            bounds_dict["fit_summary"] = {
+                "n_frames_fit": len(fit_alphas),
+                "n_frames_global_fallback": int(fit_fallbacks),
+                "alpha_median": float(np.median(fit_alphas)),
+                "beta_median":  float(np.median(fit_betas)),
+                "overlap_median_px": int(np.median(fit_overlaps)) if fit_overlaps else 0,
+            }
+    bounds_js.write_text(json.dumps(bounds_dict, indent=2))
     print(f"  saved: {bounds_js}")
     print(f"\n=== Done ===")
     return 0

@@ -128,7 +128,9 @@ def main():
     splat_targets = [
         ("V6  pruned",  ROOT / "output" / "splat_v6_da3_pruned.ply"),
         ("V23 pruned",  ROOT / "output" / "splat_v23_noinit_pruned.ply"),
+        ("V24 pruned",  ROOT / "output" / "splat_v24_noinit_pruned.ply"),
         ("V23 raw",     ROOT / "output" / "splat_v23_noinit.ply"),
+        ("V24 raw",     ROOT / "output" / "splat_v24_noinit.ply"),
     ]
     s_results = []
     for label, p in splat_targets:
@@ -148,12 +150,12 @@ def main():
 
     print(f"\n\n{'='*78}\n MESH COMPARISON: V17 vs V23 (high/mid/low LOD)\n{'='*78}")
     mesh_targets = [
-        ("V17 HIGH",  ROOT / "output" / "mesh_v17" / "mesh_v17_openmvs.ply"),
         ("V23 HIGH",  ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs.ply"),
-        ("V17 MID",   ROOT / "output" / "mesh_v17" / "mesh_v17_openmvs_mid.ply"),
+        ("V24 HIGH",  ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs.ply"),
         ("V23 MID",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_mid.ply"),
-        ("V17 LOW",   ROOT / "output" / "mesh_v17" / "mesh_v17_openmvs_low.ply"),
+        ("V24 MID",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_mid.ply"),
         ("V23 LOW",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_low.ply"),
+        ("V24 LOW",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_low.ply"),
     ]
     m_results = []
     for label, p in mesh_targets:

@@ -304,14 +304,23 @@ def scale_calibrate(project_root: Path,
                     out_ply: str = "scene_textured.ply") -> bool:
     """
     Convert mesh vertex coords from COLMAP arbitrary units → meters using
-    DA3's scale factor (read from colmap/dense/da3_bounds.json).
+    a measured scale factor. Prefers tof_bounds.json (Femto ToF — hardware-
+    measured, more accurate) and falls back to da3_bounds.json (DA3 learned-
+    metric estimate, ~7% off vs ToF on tested scenes).
     Idempotent: in_ply and out_ply may be the same file (default).
     Returns True if scaled or if no bounds file (silent skip).
     """
     omvs = project_root / _OPENMVS_DIR_REL
-    bounds = project_root / "colmap" / "dense" / "da3_bounds.json"
-    if not bounds.exists():
-        logger.info(f"  Scale calibration skipped — no {bounds.relative_to(project_root)}")
+    tof_bounds = project_root / "colmap" / "dense" / "tof_bounds.json"
+    da3_bounds = project_root / "colmap" / "dense" / "da3_bounds.json"
+    if tof_bounds.exists():
+        bounds = tof_bounds
+        logger.info(f"  Scale source: {bounds.relative_to(project_root)} (Femto ToF, measured)")
+    elif da3_bounds.exists():
+        bounds = da3_bounds
+        logger.info(f"  Scale source: {bounds.relative_to(project_root)} (DA3 estimate)")
+    else:
+        logger.info("  Scale calibration skipped — no bounds JSON found")
         return True
 
     logger.info("=== OpenMVS [5b/5]  Scale calibration — COLMAP units → meters ===")
