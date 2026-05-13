@@ -219,6 +219,12 @@ def train_nerfstudio_format(
     else:
         extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
         install_cmd = ""
+    # dn-splatter / ags-mesh reads sensor depths from depths_2/*.npy.  Our
+    # depths are float32 metres; override the default 0.001 (mm convention)
+    # so the dataparser doesn't divide them by 1000.
+    dataparser_args = f'  --downscale-factor {scale}'
+    if is_dn:
+        dataparser_args += '  --depth-unit-scale-factor 1.0 '
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
         f'-e TORCH_HOME=/workspace/torch_cache '
@@ -231,7 +237,7 @@ def train_nerfstudio_format(
         f'  --max-num-iterations {iters} '
         f'{extra_model_args}'
         f'  nerfstudio-data '
-        f'  --downscale-factor {scale}'
+        f'{dataparser_args}'
         f'"'
     )
     run(cmd)
@@ -295,10 +301,25 @@ def export_splat(project_root: Path) -> bool:
 
     write_patch_file(project_root)
 
+    # dn-splatter / ags-mesh checkpoints reference dn_splatter.dn_pipeline in
+    # config.yml — without that module installed in the container, eval_setup
+    # fails to deserialize the config. Mirror the install step from training.
+    is_dn = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    install_cmd = ""
+    if is_dn:
+        install_cmd = (
+            "pip install --upgrade -q 'setuptools>=61' wheel && "
+            "pip install -q --no-build-isolation --no-deps --force-reinstall "
+            "  /workspace/dn-splatter && "
+            "pip install -q natsort geffnet rerun-sdk pytorch-lightning "
+            "  omnidata-tools vdbfusion PyMCubes && "
+        )
+
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
         f'-e TORCH_HOME=/workspace/torch_cache '
         f'{_C("DOCKER_NERFSTUDIO")} bash -c "'
+        f'{install_cmd}'
         f'python3 /workspace/fix_weights.py && '
         f'ns-export gaussian-splat '
         f'  --load-config /workspace/{config_rel} '

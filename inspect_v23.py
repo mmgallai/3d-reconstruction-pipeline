@@ -126,11 +126,12 @@ def mesh_stats(name, path):
 def main():
     print(f"\n{'='*78}\n SPLAT COMPARISON: V6 (DA3-init) vs V23 (Femto-ToF-init)\n{'='*78}")
     splat_targets = [
-        ("V6  pruned",  ROOT / "output" / "splat_v6_da3_pruned.ply"),
         ("V23 pruned",  ROOT / "output" / "splat_v23_noinit_pruned.ply"),
         ("V24 pruned",  ROOT / "output" / "splat_v24_noinit_pruned.ply"),
+        ("V25 pruned",  ROOT / "output" / "splat_v25_noinit_pruned.ply"),
         ("V23 raw",     ROOT / "output" / "splat_v23_noinit.ply"),
         ("V24 raw",     ROOT / "output" / "splat_v24_noinit.ply"),
+        ("V25 raw",     ROOT / "output" / "splat_v25_noinit.ply"),
     ]
     s_results = []
     for label, p in splat_targets:
@@ -151,11 +152,11 @@ def main():
     print(f"\n\n{'='*78}\n MESH COMPARISON: V17 vs V23 (high/mid/low LOD)\n{'='*78}")
     mesh_targets = [
         ("V23 HIGH",  ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs.ply"),
-        ("V24 HIGH",  ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs.ply"),
+        ("V25 HIGH",  ROOT / "output" / "mesh_v25" / "mesh_v25_openmvs.ply"),
         ("V23 MID",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_mid.ply"),
-        ("V24 MID",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_mid.ply"),
+        ("V25 MID",   ROOT / "output" / "mesh_v25" / "mesh_v25_openmvs_mid.ply"),
         ("V23 LOW",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_low.ply"),
-        ("V24 LOW",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_low.ply"),
+        ("V25 LOW",   ROOT / "output" / "mesh_v25" / "mesh_v25_openmvs_low.ply"),
     ]
     m_results = []
     for label, p in mesh_targets:
