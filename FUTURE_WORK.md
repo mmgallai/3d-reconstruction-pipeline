@@ -1,5 +1,14 @@
 # Future work — not implemented in V23–V29
 
+> **Update (V30 + V31)**: Two of the three "bigger reaches" listed below
+> have now been implemented and are documented at the bottom of this file.
+> Section "0. V27 TSDF + UV atlas hybrid" is now unblocked by V31
+> (custom xatlas baker). Section "1. Real depth-supervised splatfacto-big"
+> is implemented as V30 (splat_tof plugin, bypasses dn-splatter entirely).
+> Sections 2 (IR channel) and 3 (multi-pass) remain future work.
+
+
+
 ## 0. V27 TSDF + UV atlas hybrid (blocked on OpenMVS)
 
 Wanted to combine V26's TSDF geometry (better coverage + connectivity) with
@@ -111,3 +120,83 @@ least two overlapping captures of the same scene to test against.
 Just dump all RGB + depth frames into `nerfstudio_data/images/` +
 `depths_femto/`. COLMAP will re-solve poses across all of them. Loses
 the per-session structure but works if scene overlap is sufficient.
+
+---
+
+# Implemented (V30 + V31)
+
+## V30 — splat_tof: depth-supervised splatfacto-big
+
+**Implemented in commit V30. Tag `v30`.**
+
+The `splat_tof/` package is a tiny nerfstudio plugin that subclasses
+SplatfactoModel + FullImageDatamanager to add an L1 depth loss against
+Femto's metric depths, without touching dn-splatter at all. **Densification
+stays active** because we use vanilla gsplat 1.5+ rasterization plus
+nerfstudio's stock strategy — none of the V22 patches apply.
+
+Files:
+- `splat_tof/splat_tof/depth_datamanager.py` — `FullImageDepthDatamanager`
+  (swaps `dataset_type` → `DepthDataset` so `batch["depth_image"]` exists).
+- `splat_tof/splat_tof/model.py` — `SplatfactoTofModel` overrides
+  `get_loss_dict` to add `depth_lambda · L1(pred, gt)`, with min/max valid-
+  depth masking so out-of-range pixels don't poison the loss.
+- `splat_tof/splat_tof/config.py` — `MethodSpecification("splatfacto-tof")`,
+  registered via `pyproject.toml` entry-point.
+
+Pipeline integration:
+- `lib/nerfstudio_pipeline.py` installs the plugin in the training and
+  export containers when `--train-method splatfacto-tof` is set; passes
+  `--depth-unit-scale-factor 1.0` to the dataparser (our .npy depths are
+  float32 metres).
+
+Result vs V23 baseline (Femto desk):
+- 4,042,719 raw Gaussians → 1,069,474 pruned (V23: 1.28 M → 654 K)
+- Scene BB diagonal shrunk 37% (8.77 vs 13.89 COLMAP units) — depth loss
+  pulled Gaussians off the periphery and onto the measured surface
+- Per-Gaussian max-scale median shrank 47% (0.0059 vs 0.0105) — finer
+  surface detail
+- Median opacity dropped (0.63 vs 0.975) — many more thin shells
+
+**This is the first usable depth-supervised splat on this stack**, and
+the natural successor to V23 for scenes with reliable ToF data. Whether
+it "looks better" needs visual inspection on a specific scene.
+
+## V31 — bake_tsdf_atlas.py: TSDF + xatlas UV-atlas baker
+
+**Implemented in commit V30/V31. Tag `v31`.**
+
+Unblocks V27 (TSDF + textured atlas) by replacing OpenMVS TextureMesh
+(which SIGSEGVs on marching-cubes topology) with a Python pipeline using
+**xatlas** for UV unwrap and a per-face best-view projector for colour.
+
+Workflow:
+1. Load V26 TSDF mesh, decimate to 500K faces (xatlas + face-loop scales
+   with face count).
+2. xatlas UV unwrap → packed atlas layout (default 4096×4096).
+3. For each face, project its centroid into every COLMAP camera, score by
+   front-facing dot product, pick the best view that's in-frame and in
+   front of the camera.
+4. Bake atlas: for each face, sample the RGB pixel at its centroid in the
+   best view, fill the face's UV triangle in the atlas with that colour
+   (flat-per-face shading).
+5. Write OBJ + MTL + PNG.
+
+Result on the V26 desk-scan TSDF mesh:
+- 271 K verts → 556 K UV-split verts / 500 K faces
+- 4096×4096 PNG atlas (14.7 MB), 70.3% texel coverage
+- 100% face coverage (every face got a view)
+- ~30 s runtime end-to-end
+
+Limitations:
+- Flat-shaded per-face (each triangle = best-view centroid colour). Will
+  look faceted at face boundaries. Per-pixel barycentric sampling is the
+  next refinement (~50 extra lines: walk the atlas pixels, back-project
+  through the face, sample the source image).
+- No seam-aware texture blending. Where adjacent faces pick different
+  best-views, you'll see a colour discontinuity at the shared edge.
+
+For a better-quality bake, replace step 4 with per-atlas-texel barycentric
+sampling from the chosen face's best view, plus a Laplacian smoothing
+pass across face boundaries that picked different views.
+

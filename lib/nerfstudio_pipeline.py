@@ -199,7 +199,8 @@ def train_nerfstudio_format(
     # nerfstudio/gsplat versions already in the image). Apply the source patches
     # from patches/dn_splatter_for_gsplat_15.patch to your local dn-splatter/
     # clone BEFORE running, otherwise the entry-point load fails on gsplat 1.5+.
-    is_dn = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    is_dn  = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    is_tof = method.startswith(("splatfacto-tof", "splatfacto_tof"))
     if is_dn:
         extra_model_args = (
             '  --pipeline.model.use-depth-loss True '
@@ -216,14 +217,24 @@ def train_nerfstudio_format(
             "pip install -q natsort geffnet rerun-sdk pytorch-lightning "
             "  omnidata-tools vdbfusion PyMCubes && "
         )
+    elif is_tof:
+        # V30: splat_tof plugin = splatfacto-big + L1 depth loss. Uses Femto
+        # depths via FullImageDepthDatamanager (DepthDataset under the hood).
+        # Densification stays active, unlike dn-splatter on gsplat 1.5.
+        extra_model_args = '  '
+        install_cmd = (
+            "pip install --upgrade -q 'setuptools>=61' wheel && "
+            "pip install -q --no-build-isolation --no-deps --force-reinstall "
+            "  /workspace/splat_tof && "
+        )
     else:
         extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
         install_cmd = ""
-    # dn-splatter / ags-mesh reads sensor depths from depths_2/*.npy.  Our
-    # depths are float32 metres; override the default 0.001 (mm convention)
-    # so the dataparser doesn't divide them by 1000.
+    # dn-splatter / ags-mesh / splatfacto-tof read sensor depths from
+    # depths_2/*.npy.  Our depths are float32 metres; override the default
+    # 0.001 (mm convention) so the dataparser doesn't divide them by 1000.
     dataparser_args = f'  --downscale-factor {scale}'
-    if is_dn:
+    if is_dn or is_tof:
         dataparser_args += '  --depth-unit-scale-factor 1.0 '
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
@@ -301,10 +312,11 @@ def export_splat(project_root: Path) -> bool:
 
     write_patch_file(project_root)
 
-    # dn-splatter / ags-mesh checkpoints reference dn_splatter.dn_pipeline in
-    # config.yml — without that module installed in the container, eval_setup
-    # fails to deserialize the config. Mirror the install step from training.
-    is_dn = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    # dn-splatter / ags-mesh / splatfacto-tof checkpoints reference modules
+    # not present in the stock nerfstudio image - install the plugin first
+    # so eval_setup can deserialize config.yml.
+    is_dn  = method.startswith(("dn-splatter", "dn_splatter", "ags-mesh", "ags_mesh"))
+    is_tof = method.startswith(("splatfacto-tof", "splatfacto_tof"))
     install_cmd = ""
     if is_dn:
         install_cmd = (
@@ -313,6 +325,12 @@ def export_splat(project_root: Path) -> bool:
             "  /workspace/dn-splatter && "
             "pip install -q natsort geffnet rerun-sdk pytorch-lightning "
             "  omnidata-tools vdbfusion PyMCubes && "
+        )
+    elif is_tof:
+        install_cmd = (
+            "pip install --upgrade -q 'setuptools>=61' wheel && "
+            "pip install -q --no-build-isolation --no-deps --force-reinstall "
+            "  /workspace/splat_tof && "
         )
 
     cmd = (

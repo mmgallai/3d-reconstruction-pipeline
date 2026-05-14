@@ -127,11 +127,11 @@ def main():
     print(f"\n{'='*78}\n SPLAT COMPARISON: V6 (DA3-init) vs V23 (Femto-ToF-init)\n{'='*78}")
     splat_targets = [
         ("V23 pruned",  ROOT / "output" / "splat_v23_noinit_pruned.ply"),
-        ("V24 pruned",  ROOT / "output" / "splat_v24_noinit_pruned.ply"),
         ("V25 pruned",  ROOT / "output" / "splat_v25_noinit_pruned.ply"),
+        ("V30 pruned",  ROOT / "output" / "splat_v30_noinit_pruned.ply"),
         ("V23 raw",     ROOT / "output" / "splat_v23_noinit.ply"),
-        ("V24 raw",     ROOT / "output" / "splat_v24_noinit.ply"),
         ("V25 raw",     ROOT / "output" / "splat_v25_noinit.ply"),
+        ("V30 raw",     ROOT / "output" / "splat_v30_noinit.ply"),
     ]
     s_results = []
     for label, p in splat_targets:

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splat_tof"
+version = "0.1.0"
+description = "Depth-supervised splatfacto for Femto ToF data (V30)."
+requires-python = ">=3.8"
+dependencies = []
+
+[project.entry-points."nerfstudio.method_configs"]
+splatfacto-tof = "splat_tof.config:splatfacto_tof"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["splat_tof*"]
