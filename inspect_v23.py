@@ -150,12 +150,12 @@ def main():
 
     print(f"\n\n{'='*78}\n MESH COMPARISON: V17 vs V23 (high/mid/low LOD)\n{'='*78}")
     mesh_targets = [
-        ("V23 HIGH",  ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs.ply"),
-        ("V24 HIGH",  ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs.ply"),
-        ("V23 MID",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_mid.ply"),
-        ("V24 MID",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_mid.ply"),
-        ("V23 LOW",   ROOT / "output" / "mesh_v23" / "mesh_v23_openmvs_low.ply"),
-        ("V24 LOW",   ROOT / "output" / "mesh_v24" / "mesh_v24_openmvs_low.ply"),
+        ("V32 fast HIGH", ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs.ply"),
+        ("V32 best HIGH", ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs.ply"),
+        ("V32 fast MID",  ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs_mid.ply"),
+        ("V32 best MID",  ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs_mid.ply"),
+        ("V32 fast LOW",  ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs_low.ply"),
+        ("V32 best LOW",  ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs_low.ply"),
     ]
     m_results = []
     for label, p in mesh_targets:
