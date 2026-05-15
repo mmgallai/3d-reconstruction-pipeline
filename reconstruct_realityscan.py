@@ -102,6 +102,14 @@ def parse_args():
     # -- Mode flags -----------------------------------------------------------
     p.add_argument("--quick", action="store_true",
                    help="1000 iterations, 4x downscale, skip MVS (fast test).")
+    p.add_argument("--downscale-factor", type=int, default=None,
+                   help="Override NERF_DOWNSCALE_FACTOR (config.py). "
+                        "1=full res, 2=half (default), 4=quarter. Bigger GPU "
+                        "→ smaller factor → sharper output but more VRAM.")
+    p.add_argument("--iters", type=int, default=None,
+                   help="Override NERF_MAX_ITERATIONS (config.py). "
+                        "Default 30000; raise to 50000+ on stronger hardware "
+                        "for marginally higher splat fidelity.")
     p.add_argument("--skip-mvs", action="store_true",
                    help="Skip COLMAP MVS — use sparse COLMAP points as Gaussian init.")
     p.add_argument("--skip-training", action="store_true",
@@ -187,6 +195,15 @@ def main():
         config.NERF_DOWNSCALE_FACTOR = 4
         args.skip_mvs = True
         logger.info("Quick mode: 1000 iterations, 4x downscale, MVS skipped.")
+
+    # Explicit CLI overrides take precedence over config.py defaults but lose
+    # to --quick (above), since quick is the explicit "I want a fast test" knob.
+    if args.iters is not None:
+        config.NERF_MAX_ITERATIONS = args.iters
+        logger.info(f"Iterations overridden: NERF_MAX_ITERATIONS = {args.iters}")
+    if args.downscale_factor is not None:
+        config.NERF_DOWNSCALE_FACTOR = args.downscale_factor
+        logger.info(f"Downscale overridden: NERF_DOWNSCALE_FACTOR = {args.downscale_factor}")
 
     _banner(project_root, scan_dir, out_dir, args)
 
