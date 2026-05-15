@@ -244,8 +244,32 @@ def main():
             logger.info(f"  Preserved fused.ply → {fused_backup}")
 
         images_rel = jpeg_dir.relative_to(project_root).as_posix()
+
+        # V32: if Femto intrinsics JSON is present, seed COLMAP with the
+        # vendor PINHOLE params and lock them during bundle adjustment.
+        # SfM becomes faster and more robust (no joint focal/principal
+        # solve), and the back-projection in femto_to_init.py uses the
+        # measured camera, not COLMAP's estimate.
+        intr_json = project_root / "nerfstudio_data" / "femto_intrinsics.json"
+        cam_model_arg = None
+        cam_params_arg = None
+        if args.use_femto_depth and intr_json.exists():
+            import json as _json
+            try:
+                intr = _json.loads(intr_json.read_text())["color_intrinsics"]
+                cam_model_arg  = "PINHOLE"
+                cam_params_arg = (f"{intr['fx']:.4f},{intr['fy']:.4f},"
+                                  f"{intr['cx']:.4f},{intr['cy']:.4f}")
+                logger.info(f"  Femto vendor intrinsics found → {cam_model_arg} "
+                            f"{cam_params_arg} (locked during BA)")
+            except Exception as _e:
+                logger.warning(f"  Could not read {intr_json.name}: {_e}; "
+                               f"falling back to COLMAP-estimated intrinsics")
+
         colmap_pipeline.run_full_unmasked_sfm(
             project_root, images_rel=images_rel,
+            camera_model=cam_model_arg,
+            camera_params=cam_params_arg,
         )
 
         # Restore fused.ply if it was backed up

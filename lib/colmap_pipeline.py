@@ -24,12 +24,21 @@ def feature_extraction_and_matching(
     images_rel: str,          # path relative to /project inside container
     db_rel: str,              # path relative to /project inside container
     mask_rel: Optional[str] = None,
+    camera_model: Optional[str] = None,
+    camera_params: Optional[str] = None,
 ) -> None:
     """
     Run COLMAP feature extraction and exhaustive matching.
-    mask_rel: if provided, pass as --ImageReader.mask_path (masked SfM).
+    mask_rel:     if provided, pass as --ImageReader.mask_path (masked SfM).
+    camera_model: override COLMAP_CAMERA_MODEL (e.g. "PINHOLE" when seeding
+                  vendor intrinsics).
+    camera_params: if provided, COMMA-separated string of params for the
+                  chosen camera_model. For PINHOLE = "fx,fy,cx,cy".  When
+                  set, COLMAP treats these as priors rather than estimating.
     """
     mask_arg = f"--ImageReader.mask_path /project/{mask_rel} " if mask_rel else ""
+    cam_model = camera_model or COLMAP_CAMERA_MODEL
+    params_arg = f"--ImageReader.camera_params {camera_params} " if camera_params else ""
 
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} {DOCKER_COLMAP} bash -lc "'
@@ -39,7 +48,8 @@ def feature_extraction_and_matching(
         f'  --database_path /project/{db_rel} '
         f'  --image_path /project/{images_rel} '
         f'  --ImageReader.single_camera {COLMAP_SINGLE_CAMERA} '
-        f'  --ImageReader.camera_model {COLMAP_CAMERA_MODEL} '
+        f'  --ImageReader.camera_model {cam_model} '
+        f'  {params_arg}'
         f'  {mask_arg}'
         f'; colmap exhaustive_matcher --database_path /project/{db_rel}'
         f'"'
@@ -150,27 +160,38 @@ def run_mvs(
 def run_full_unmasked_sfm(
     project_root: Path,
     images_rel: str = "colmap/images",
+    camera_model: Optional[str] = None,
+    camera_params: Optional[str] = None,
 ) -> Path:
     """
     Unmasked SfM on raw images → undistorted images in colmap/dense.
 
-    images_rel: path to input images relative to project_root
-                (default "colmap/images", can be "nerfstudio_data/images" etc.)
+    images_rel:   path to input images relative to project_root
+                  (default "colmap/images", can be "nerfstudio_data/images" etc.)
+    camera_model: override the default model (e.g. "PINHOLE" when seeding
+                  vendor intrinsics).
+    camera_params: COMMA-separated camera parameters for the chosen model.
+                   When set, COLMAP uses these as priors and we lock them
+                   during the mapper bundle-adjust (refine_intrinsics=False).
 
     Returns the relative path (from project_root) to the best sparse model.
     """
     logger.info("=== COLMAP SfM (feature extraction + matching + sparse reconstruction) ===")
+    if camera_params:
+        logger.info(f"  using vendor intrinsics prior: {camera_model} {camera_params}")
     feature_extraction_and_matching(
         project_root,
         images_rel=images_rel,
         db_rel="colmap/database/sfm.db",
+        camera_model=camera_model,
+        camera_params=camera_params,
     )
     sparse_reconstruction(
         project_root,
         images_rel=images_rel,
         db_rel="colmap/database/sfm.db",
         sparse_out_rel="colmap/sparse",
-        refine_intrinsics=True,
+        refine_intrinsics=(camera_params is None),
     )
     best = best_sparse_model(project_root / "colmap" / "sparse")
     sparse_model_rel = f"colmap/sparse/{best.name}"
