@@ -383,6 +383,7 @@ def run_full_mesh_pipeline(project_root: Path,
                            pointcloud_rel:  str | None = None,  # legacy, unused now
                            do_refine: bool = False,
                            refine_resolution_level: int = 2,
+                           force_refine: bool = False,
                            do_scale_calibrate: bool = True,
                            use_poisson: bool = False,
                            poisson_depth: int = 11) -> Path | None:
@@ -452,6 +453,12 @@ def run_full_mesh_pipeline(project_root: Path,
     # ── Stage 4: RefineMesh (optional) ──────────────────────────────────────
     scene_mesh_refine = omvs / "scene_mesh_refine.ply"
     if do_refine:
+        # force_refine=True (user passed --mesh-quality high/best) invalidates
+        # the cache so the higher-resolution refine actually runs.
+        if force_refine and scene_mesh_refine.exists():
+            logger.info(f"  force_refine=True - removing cached scene_mesh_refine.ply "
+                        f"to re-run at res-level {refine_resolution_level}")
+            scene_mesh_refine.unlink()
         if (scene_mesh_refine.exists()
                 and scene_mesh_clean.exists()
                 and scene_mesh_refine.stat().st_mtime > scene_mesh_clean.stat().st_mtime):

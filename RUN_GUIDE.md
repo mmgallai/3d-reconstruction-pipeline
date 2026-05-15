@@ -151,10 +151,29 @@ python reconstruct_realityscan.py `
     --skip-mvs `
     --use-femto-depth `
     --downscale-factor 1 `
-    --iters 50000
+    --iters 50000 `
+    --mesh-quality best
 ```
 
-About 40–60 min on a 32 GB GPU with a 263-frame dataset.
+About 2–3 hours on a 32 GB GPU with a 263-frame dataset (~1 hour splat
+training + ~80 min RefineMesh at full image resolution + ~15 min for the
+other OpenMVS stages and packaging).
+
+### Mesh-only re-run (after splat training already finished)
+
+If the splat is done and you only want to upgrade the mesh quality (e.g.
+re-run today's V32 run at higher mesh quality), skip training:
+
+```powershell
+python reconstruct_realityscan.py `
+    --skip-mvs `
+    --use-femto-depth `
+    --skip-training `
+    --mesh-quality best
+```
+
+`--mesh-quality high` or `best` forces RefineMesh to re-run even if a
+previous (lower-quality) `scene_mesh_refine.ply` is cached.
 
 ### Flag reference
 
@@ -164,6 +183,7 @@ About 40–60 min on a 32 GB GPU with a 263-frame dataset.
 | `--skip-mvs` | Skip OpenMVS DensifyPointCloud → use sparse COLMAP points (or hybrid init) instead | Faster; recommended for V23 path |
 | `--downscale-factor N` | Train splat at 1/N image resolution. **N=1 full res, N=2 half, N=4 quarter** | Higher N = less VRAM, faster, lower quality. Default 2 |
 | `--iters N` | Train for N iterations. Default 30000. **50000+ on strong GPUs** | More iters = sharper but diminishing returns past 30-50K |
+| `--mesh-quality {fast,high,best}` | OpenMVS RefineMesh resolution. fast=res-2 (default, ~5 min), high=res-1 (~20 min), **best=res-0 full-image-resolution (~80 min)** | Affects mesh only, splat unchanged. high / best force RefineMesh to re-run even if a cached output exists |
 | `--train-method NAME` | `splatfacto-big` (default), `splatfacto`, `splatfacto-tof` (depth-supervised, V30), `ags-mesh` (V25 regression) | V30 visually worse than V24 on tested scenes |
 | `--quick` | 1000 iters @ 4× downscale + skip MVS | 3-min sanity-check, low-quality output |
 | `--skip-training` | Skip splat training, jump to export from existing checkpoint | Useful for re-running mesh/export stages |
@@ -173,13 +193,23 @@ About 40–60 min on a 32 GB GPU with a 263-frame dataset.
 
 ### Recommended config per GPU class
 
-| GPU VRAM | `--downscale-factor` | `--iters` | Notes |
+| GPU VRAM | `--downscale-factor` | `--iters` | `--mesh-quality` | Total time (263 frames) |
+|---|---|---|---|---|
+| 8 GB (3070, 4060) | 4 | 20000 | fast | ~25 min |
+| 12 GB (3060, 4070) | 2 | 30000 | fast | ~30 min |
+| 16 GB (4080, A4000) | 2 | 30000 | high | ~50 min |
+| **24 GB (4090, 3090)** | **1** | **50000** | **high** | ~75 min |
+| **32 GB+ (5090, A6000, A100)** | **1** | **50000** | **best** | ~3 hours |
+
+**`--mesh-quality` is the single biggest mesh-quality lever** — it controls
+OpenMVS's `RefineMesh --resolution-level`. The splat is unaffected by this
+flag, the mesh is dramatically affected.
+
+| Setting | Maps to | RefineMesh time | Mesh sharpness |
 |---|---|---|---|
-| 8 GB (3070, 4060) | 4 | 20000 | Use `--quick` first to verify setup |
-| 12 GB (3060, 4070) | 2 | 30000 | Same as V23/V24 defaults |
-| 16 GB (4080, A4000) | 2 | 30000 | Default works well |
-| **24 GB (4090, 3090)** | **1** | **50000** | Full capacity |
-| **32 GB+ (5090, A6000, A100)** | **1** | **50000** | Full capacity, sometimes 100K for diminishing returns |
+| `fast` (default) | res-level 2 (quarter-res images) | ~5 min | Decent |
+| `high` | res-level 1 (half-res images) | ~20 min | Noticeably sharper |
+| `best` | res-level 0 (full image resolution) | ~80 min | Photographic fidelity |
 
 ---
 

@@ -110,6 +110,15 @@ def parse_args():
                    help="Override NERF_MAX_ITERATIONS (config.py). "
                         "Default 30000; raise to 50000+ on stronger hardware "
                         "for marginally higher splat fidelity.")
+    p.add_argument("--mesh-quality", choices=["fast", "high", "best"],
+                   default="fast",
+                   help="OpenMVS RefineMesh resolution: "
+                        "fast=res-level 2 (~5 min, default), "
+                        "high=res-level 1 (~20 min), "
+                        "best=res-level 0 (~80 min, full image resolution). "
+                        "Affects the mesh only - not the splat. "
+                        "high / best force RefineMesh to re-run even if "
+                        "scene_mesh_refine.ply is cached.")
     p.add_argument("--skip-mvs", action="store_true",
                    help="Skip COLMAP MVS — use sparse COLMAP points as Gaussian init.")
     p.add_argument("--skip-training", action="store_true",
@@ -507,22 +516,37 @@ def main():
     # ── 9b. OpenMVS textured-mesh path (parallel to 3DGS) ─────────────────────
     openmvs_mesh_path = None
     if args.openmvs_mesh:
-        # Skip if already done for this dense workspace
+        # Skip if already done for this dense workspace — UNLESS the user is
+        # asking for a higher-quality RefineMesh, in which case we must re-run
+        # the OpenMVS pipeline so the new resolution-level actually takes effect.
         existing_mesh = project_root / "openmvs" / "scene_textured.ply"
         fused_ply     = dense_dir / "fused.ply"
-        if (existing_mesh.exists()
-                and fused_ply.exists()
-                and existing_mesh.stat().st_mtime > fused_ply.stat().st_mtime):
+        skip_outer = (existing_mesh.exists()
+                      and fused_ply.exists()
+                      and existing_mesh.stat().st_mtime > fused_ply.stat().st_mtime
+                      and args.mesh_quality == "fast")
+        if skip_outer:
             logger.info("--- Stage 8b: OpenMVS textured mesh (skipping — already up to date) ---")
             openmvs_mesh_path = existing_mesh
         else:
             logger.info("--- Stage 8b: OpenMVS textured-mesh pipeline ---")
+            quality_to_level = {"fast": 2, "high": 1, "best": 0}
+            refine_level = quality_to_level[args.mesh_quality]
+            # high / best are explicit user requests -> force re-run even if a
+            # lower-quality refined mesh is already cached
+            force_refine = args.mesh_quality in ("high", "best")
+            logger.info(f"  mesh quality: {args.mesh_quality} (RefineMesh "
+                        f"--resolution-level {refine_level}"
+                        + ("; cached output will be discarded" if force_refine else "")
+                        + ")")
             try:
                 openmvs_mesh_path = openmvs_pipeline.run_full_mesh_pipeline(
                     project_root,
                     colmap_dense_rel = "colmap/dense",
                     pointcloud_rel   = None,  # use depth maps in scene.mvs (avoids SIGSEGV)
                     do_refine        = args.refine_mesh,
+                    refine_resolution_level = refine_level,
+                    force_refine     = force_refine,
                     use_poisson      = args.poisson_mesh,
                     poisson_depth    = args.poisson_depth,
                 )
