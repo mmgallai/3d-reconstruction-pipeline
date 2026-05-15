@@ -21,11 +21,12 @@ Live preview shows:
   - Optional sparse-flow motion vectors (M toggle), used by motion-auto
 
 Hotkeys / buttons:
-  SPACE         capture current frame
+  SPACE         capture current frame (shutter beep fires regardless of mode)
   A             toggle auto-capture by time (1 frame every AUTO_INTERVAL_SEC sec)
   M             toggle motion-triggered auto-capture (1 frame per ~AUTO_MOTION_CM cm)
-  D             toggle depth preview overlay
-  S             toggle audio cues (beep on save / warning)
+  D             toggle depth preview overlay (range-zone colour-coded)
+  C             toggle coverage minimap (yaw x pitch grid, where you've pointed)
+  S             toggle audio cues (shutter on save / warning on out-of-range)
   ESC           finish session, write intrinsics, exit
 
 Usage:
@@ -265,10 +266,23 @@ def main() -> int:
             if audio_on:
                 try: winsound.Beep(freq, dur_ms)
                 except Exception: pass
+        def _shutter_sound():
+            """Two-tone 'shutter click' for save events. Loud + distinctive,
+            fires regardless of SPACE / time-auto / motion-auto."""
+            if not audio_on:
+                return
+            try:
+                winsound.Beep(1800, 50)
+                winsound.Beep(1100, 60)
+            except Exception:
+                pass
     except ImportError:
         def _beep(freq=1200, dur_ms=80):
             if audio_on:
                 sys.stdout.write("\a"); sys.stdout.flush()
+        def _shutter_sound():
+            if audio_on:
+                sys.stdout.write("\a\a"); sys.stdout.flush()
 
     saved_count = 0
     last_auto_t = 0.0
@@ -290,14 +304,23 @@ def main() -> int:
     motion_cm_accum = 0.0     # accumulated camera motion since last save (cm)
     motion_target_cm = float(args.motion_cm)
 
+    # Coverage minimap state: integrate pixel-displacement -> yaw/pitch (radians)
+    # using fx/fy and small-angle approx. Drifts over time, but for a few-minute
+    # sweep it's a useful "where have I pointed the camera" overview.
+    show_coverage = False                   # toggled by C
+    COV_YAW_BINS, COV_PITCH_BINS = 24, 8    # 15 deg yaw, ~22 deg pitch
+    cov_yaw_rad   = 0.0                     # cumulative orientation, 0 at start
+    cov_pitch_rad = 0.0
+    cov_hits: dict[tuple[int, int], int] = {}    # bin -> capture count
+
     # Mouse-clickable button rectangles. Recomputed each frame so they scale
     # with the preview, but stored at module-level for the callback closure.
     BUTTON_HEIGHT = 60
     button_rects: dict[str, tuple] = {}  # label -> (x1, y1, x2, y2)
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal saved_count, auto_mode, motion_mode, show_depth, audio_on
-        nonlocal requested_quit, requested_save
+        nonlocal saved_count, auto_mode, motion_mode, show_depth, show_coverage
+        nonlocal audio_on, requested_quit, requested_save
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         for label, (x1, y1, x2, y2) in button_rects.items():
@@ -314,13 +337,15 @@ def main() -> int:
                         auto_mode = False     # exclusive
                 elif label == "DEPTH":
                     show_depth = not show_depth
+                elif label == "COVERAGE":
+                    show_coverage = not show_coverage
                 elif label == "SOUND":
                     audio_on = not audio_on
                 elif label == "FINISH":
                     requested_quit = True
                 return
 
-    window_name = "Femto capture (click buttons or SPACE/A/M/D/S/ESC)"
+    window_name = "Femto capture (click buttons or SPACE/A/M/D/C/S/ESC)"
     if not args.no_preview:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_name, on_mouse)
@@ -379,7 +404,9 @@ def main() -> int:
             border = (0, 220, 0) if good_frame else (0, 0, 220)
 
             # Motion estimate: track ORB features on a downsampled gray + median
-            # px displacement. Convert px -> metres via fx and the centre depth.
+            # px displacement. Convert px -> metres via fx + centre depth, and
+            # also (separately, by axis) into yaw/pitch radians for the
+            # coverage minimap.
             gray_small = cv2.resize(gray, (gray.shape[1] // 4, gray.shape[0] // 4))
             kp = orb.detect(gray_small, None)
             kp, desc = orb.compute(gray_small, kp)
@@ -388,20 +415,31 @@ def main() -> int:
                 bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
                 matches = bf.match(prev_desc, desc)
                 if len(matches) >= 10:
-                    dists = []
+                    dxs, dys = [], []
                     for m in matches:
                         pp = prev_kp[m.queryIdx].pt
                         qp = kp[m.trainIdx].pt
-                        dists.append(((pp[0] - qp[0]) ** 2 + (pp[1] - qp[1]) ** 2) ** 0.5)
-                    px_med = float(np.median(dists)) * 4.0  # un-do 4x downsample
+                        dxs.append(qp[0] - pp[0])
+                        dys.append(qp[1] - pp[1])
+                    dx_med = float(np.median(dxs)) * 4.0   # un-do 4x downsample
+                    dy_med = float(np.median(dys)) * 4.0
+                    px_med = (dx_med ** 2 + dy_med ** 2) ** 0.5
                     # Convert pixel motion to metres: use color intrinsics fx + center depth
                     fx = 1100.0
+                    fy = 1100.0
                     if last_intrinsics is not None:
                         fx = float(last_intrinsics["color_intrinsics"]["fx"])
+                        fy = float(last_intrinsics["color_intrinsics"]["fy"])
                     if center_depth > 0:
                         motion_m = (px_med / fx) * center_depth
                         motion_cm_this_frame = motion_m * 100.0
                         motion_cm_accum += motion_cm_this_frame
+                    # Coverage: features shift LEFT (-dx) when camera pans RIGHT.
+                    # Small-angle approx: dyaw ≈ -dx_px / fx, dpitch ≈ +dy_px / fy.
+                    # (dy positive when camera tilts DOWN; here we use +dy so
+                    # tilting down -> pitch increases positive == "below horizon")
+                    cov_yaw_rad   += -dx_med / fx
+                    cov_pitch_rad +=  dy_med / fy
             prev_kp, prev_desc = kp, desc
 
             # Capture if asked
@@ -487,22 +525,78 @@ def main() -> int:
                 cv2.drawMarker(preview, (Wh // 2, Hh // 2), range_color,
                                markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
+                # Coverage minimap (C toggle): yaw x pitch grid in top-right,
+                # showing which directions have been captured. Like Polycam's
+                # coverage overlay, but estimated from ORB-feature integration
+                # (no IMU), so it drifts on long sweeps - still useful as a
+                # "where have I pointed the camera" sanity check.
+                if show_coverage:
+                    pad_r = 12
+                    map_w, map_h = 280, 100      # minimap pixel size
+                    map_x0 = preview.shape[1] - map_w - pad_r
+                    map_y0 = 90
+                    cell_w = map_w // COV_YAW_BINS
+                    cell_h = map_h // COV_PITCH_BINS
+                    # Background panel
+                    cv2.rectangle(preview, (map_x0 - 4, map_y0 - 22),
+                                  (map_x0 + map_w + 4, map_y0 + map_h + 4),
+                                  (20, 20, 20), -1)
+                    pct = 100.0 * len(cov_hits) / (COV_YAW_BINS * COV_PITCH_BINS)
+                    cv2.putText(preview, f"coverage: {len(cov_hits)} cells ({pct:.0f}%)",
+                                (map_x0, map_y0 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
+                    # Paint cells
+                    max_count = max(cov_hits.values()) if cov_hits else 1
+                    for y in range(COV_PITCH_BINS):
+                        for x in range(COV_YAW_BINS):
+                            cx1 = map_x0 + x * cell_w
+                            cy1 = map_y0 + y * cell_h
+                            cx2 = cx1 + cell_w - 1
+                            cy2 = cy1 + cell_h - 1
+                            n = cov_hits.get((x, y), 0)
+                            if n == 0:
+                                cell_color = (40, 40, 100)        # dark red = uncovered
+                            else:
+                                # green intensity scales with frame count, capped
+                                intensity = min(255, 100 + int(155 * n / max_count))
+                                cell_color = (0, intensity, 0)
+                            cv2.rectangle(preview, (cx1, cy1), (cx2, cy2), cell_color, -1)
+                    # Grid lines
+                    for x in range(COV_YAW_BINS + 1):
+                        gx = map_x0 + x * cell_w
+                        cv2.line(preview, (gx, map_y0), (gx, map_y0 + map_h), (80, 80, 80), 1)
+                    for y in range(COV_PITCH_BINS + 1):
+                        gy = map_y0 + y * cell_h
+                        cv2.line(preview, (map_x0, gy), (map_x0 + map_w, gy), (80, 80, 80), 1)
+                    # Mark current orientation with a yellow dot
+                    import math as _m
+                    yaw_norm = ((cov_yaw_rad / (2 * _m.pi)) + 0.5) % 1.0
+                    cur_x_bin  = int(yaw_norm * COV_YAW_BINS) % COV_YAW_BINS
+                    pitch_norm = max(0.0, min(0.9999, (cov_pitch_rad / _m.pi) + 0.5))
+                    cur_y_bin  = int(pitch_norm * COV_PITCH_BINS)
+                    dot_x = map_x0 + cur_x_bin * cell_w + cell_w // 2
+                    dot_y = map_y0 + cur_y_bin * cell_h + cell_h // 2
+                    cv2.circle(preview, (dot_x, dot_y), 4, (0, 255, 255), -1)
+                    cv2.circle(preview, (dot_x, dot_y), 5, (0, 0, 0), 1)
+
                 # Bottom button bar
                 H, W = preview.shape[:2]
                 bar_h = BUTTON_HEIGHT
                 cv2.rectangle(preview, (0, H - bar_h), (W, H), (30, 30, 30), -1)
                 btn_defs = [
-                    ("SAVE",   "[SPACE] Save",
+                    ("SAVE",     "[SPACE] Save",
                      (0, 180, 0) if good_frame else (100, 100, 100)),
-                    ("TIME",   f"[A] Time-auto: {'ON' if auto_mode else 'OFF'}",
+                    ("TIME",     f"[A] Time-auto: {'ON' if auto_mode else 'OFF'}",
                      (0, 180, 0) if auto_mode else (80, 80, 200)),
-                    ("MOTION", f"[M] Motion-auto: {'ON' if motion_mode else 'OFF'}",
+                    ("MOTION",   f"[M] Motion-auto: {'ON' if motion_mode else 'OFF'}",
                      (0, 180, 0) if motion_mode else (80, 80, 200)),
-                    ("DEPTH",  f"[D] Depth: {'ON' if show_depth else 'OFF'}",
+                    ("DEPTH",    f"[D] Depth: {'ON' if show_depth else 'OFF'}",
                      (0, 180, 0) if show_depth else (80, 80, 200)),
-                    ("SOUND",  f"[S] Sound: {'ON' if audio_on else 'OFF'}",
+                    ("COVERAGE", f"[C] Coverage: {'ON' if show_coverage else 'OFF'}",
+                     (0, 180, 0) if show_coverage else (80, 80, 200)),
+                    ("SOUND",    f"[S] Sound: {'ON' if audio_on else 'OFF'}",
                      (0, 180, 0) if audio_on else (80, 80, 200)),
-                    ("FINISH", "[ESC] Finish",
+                    ("FINISH",   "[ESC] Finish",
                      (40, 40, 200)),
                 ]
                 slot_w = W // len(btn_defs)
@@ -543,6 +637,9 @@ def main() -> int:
                           f"(every {motion_target_cm:.1f} cm)")
                 elif key in (ord("d"), ord("D")):
                     show_depth = not show_depth
+                elif key in (ord("c"), ord("C")):
+                    show_coverage = not show_coverage
+                    print(f"  coverage minimap: {'ON' if show_coverage else 'OFF'}")
                 elif key in (ord("s"), ord("S")):
                     audio_on = not audio_on
                     print(f"  audio cues: {'ON' if audio_on else 'OFF'}")
@@ -559,12 +656,22 @@ def main() -> int:
                     # 16-bit PNG to preserve full dynamic range.
                     cv2.imwrite(str(depths_dir / f"{stem}_ir.png"), ir_u16)
                 saved_count += 1
-                _beep(freq=1200, dur_ms=60)
+                _shutter_sound()              # 2-tone shutter click on every save
                 motion_cm_accum = 0.0
+                # Record coverage bin for this frame's orientation
+                import math as _m
+                yaw_norm = ((cov_yaw_rad / (2 * _m.pi)) + 0.5) % 1.0
+                yaw_bin  = int(yaw_norm * COV_YAW_BINS) % COV_YAW_BINS
+                pitch_norm = (cov_pitch_rad / _m.pi) + 0.5
+                pitch_norm = max(0.0, min(0.9999, pitch_norm))
+                pitch_bin = int(pitch_norm * COV_PITCH_BINS)
+                cov_hits[(yaw_bin, pitch_bin)] = cov_hits.get((yaw_bin, pitch_bin), 0) + 1
+
                 if saved_count % 10 == 0 or args.no_preview:
                     print(f"  captured {saved_count} frames  "
                           f"(in-range {in_range_pct:.1f}%, blur {blur:.0f}, "
-                          f"center {center_depth:.2f}m)")
+                          f"center {center_depth:.2f}m, "
+                          f"coverage {len(cov_hits)}/{COV_YAW_BINS*COV_PITCH_BINS} cells)")
                 if saved_count >= args.max_frames:
                     print(f"  reached max_frames={args.max_frames}, stopping.")
                     break

@@ -98,9 +98,20 @@ The capture script now actively helps you follow this protocol:
   as `IMG_femto_NNNN_ir.png` (uint16). Useful for textureless surfaces
   where RGB has no features but IR does. Disable with `--no-ir`.
 
-- **Audio cues** (`S` toggle, on by default) — beeps:
-  - HIGH on save (1200 Hz, 60 ms) — confirms a frame without looking at
-    the screen
+- **Coverage minimap** (`C` toggle) — Polycam-style coverage overview in
+  the top-right corner of the preview. A 24-column (yaw) × 8-row (pitch)
+  grid showing where your camera has pointed:
+  - DARK RED cells = no captures pointing here yet
+  - GREEN cells = captured (brighter = more frames)
+  - YELLOW dot = current camera direction
+  - Header shows total covered cells / percentage
+  - Estimated from ORB feature integration (no IMU), so it drifts on
+    long sweeps — still useful as a "did I sweep the back side?"
+    sanity check. Reset implicitly when you start a new session.
+
+- **Audio cues** (`S` toggle, on by default):
+  - SHUTTER (2-tone: 1800 Hz → 1100 Hz) on every save — fires for
+    SPACE, time-auto, AND motion-auto. Distinctive and unmistakable.
   - LOW (600 Hz) when too close, MID (900 Hz) when too far — sweep with
     eyes on the subject, ears on the camera. Rate-limited to 2 sec.
 
