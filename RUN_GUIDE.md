@@ -122,12 +122,61 @@ Three locations to copy. Layout must match exactly:
 
 **Total dataset size: roughly 3 GB for a 263-frame capture.**
 
-Copy via scp / SMB / external drive. After copying, sanity-check the counts:
+### Recommended transfer methods (fastest → slowest)
+
+The 3 GB dataset is small enough that almost any method works in under
+30 minutes. Pick whichever is most convenient.
+
+**Step 1 (always): compress to a single archive on the source machine**
+
+Putting ~800 small files into one archive transfers about 10× faster than
+copying file-by-file over any network or USB protocol. From the repo root
+on the source machine:
+
+```powershell
+# Windows PowerShell
+Compress-Archive -Path nerfstudio_data -DestinationPath nerfstudio_data.zip
+# Result: roughly 2.5 GB single file (JPGs are already compressed, .npy
+# files compress moderately well)
+```
+
+Or with 7-Zip for slightly better compression + much faster on huge file
+counts:
+```powershell
+7z a -mx=5 nerfstudio_data.7z nerfstudio_data
+```
+
+**Step 2: ship the archive**
+
+| Method | Setup needed | Transfer time (3 GB) | When to use |
+|---|---|---|---|
+| **USB-3 external SSD / stick** | Format NTFS or exFAT | 30–60 sec | Both machines are physically nearby |
+| **Direct LAN SMB share** | Right-click folder → Properties → Share | 1–2 min on gigabit LAN | Both on the same Wi-Fi / Ethernet |
+| **`scp` / `rsync` over LAN** | SSH server enabled on dest | 1–2 min | Linux dest or Win11 with OpenSSH |
+| **OneDrive / Google Drive** | None (assuming logged-in) | 5–15 min upload + same to download | No physical access; cross-network |
+| **WeTransfer / Dropbox Transfer** | None | 10–30 min total | Same as above, no cloud account on dest |
+
+**Step 3: extract on the destination**
+
+After copying the archive into the new repo's root:
+```powershell
+Expand-Archive -Path nerfstudio_data.zip -DestinationPath .
+# or: 7z x nerfstudio_data.7z
+```
+
+**Sanity-check after extract:**
 
 ```powershell
 (Get-ChildItem nerfstudio_data\images -Filter *.jpg).Count
-# Should match:
+# Should equal:
 (Get-ChildItem nerfstudio_data\depths_femto -Filter *.npy | Where-Object { $_.Name -notlike "*_conf*" }).Count
+# Should also have:
+Test-Path nerfstudio_data\femto_intrinsics.json   # → True
+```
+
+The current 263-frame dataset on **this** machine lives at:
+```
+C:\Users\mgallai\Projects\3d_automated\reconstruction_project\nerfstudio_data\
 ```
 
 ---
@@ -151,13 +200,15 @@ python reconstruct_realityscan.py `
     --skip-mvs `
     --use-femto-depth `
     --downscale-factor 1 `
-    --iters 50000 `
-    --mesh-quality best
+    --iters 50000
 ```
 
-About 2–3 hours on a 32 GB GPU with a 263-frame dataset (~1 hour splat
-training + ~80 min RefineMesh at full image resolution + ~15 min for the
-other OpenMVS stages and packaging).
+About 50–75 min on a 24-32 GB GPU with a 263-frame dataset (~50 min splat
+training at full res + ~10 min OpenMVS + ~5 min packaging).
+
+If your subject is room-scale or strongly textured, also add
+`--mesh-quality high` (or `best`); skip it for desk-scale scenes (`fast`
+default gives identical visual output, in our test).
 
 ### Mesh-only re-run (after splat training already finished)
 
@@ -197,19 +248,60 @@ previous (lower-quality) `scene_mesh_refine.ply` is cached.
 |---|---|---|---|---|
 | 8 GB (3070, 4060) | 4 | 20000 | fast | ~25 min |
 | 12 GB (3060, 4070) | 2 | 30000 | fast | ~30 min |
-| 16 GB (4080, A4000) | 2 | 30000 | high | ~50 min |
-| **24 GB (4090, 3090)** | **1** | **50000** | **high** | ~75 min |
-| **32 GB+ (5090, A6000, A100)** | **1** | **50000** | **best** | ~3 hours |
+| 16 GB (4080, A4000) | 2 | 30000 | fast | ~35 min |
+| **24 GB (4090, 3090)** | **1** | **50000** | **fast** (desk) / **high** (room) | ~50–75 min |
+| **32 GB+ (5090, A6000, A100)** | **1** | **50000** | **fast** (desk) / **best** (large/textured scene) | ~50 min – 3 hours |
+
+**Why `fast` even on a strong GPU:** on the 263-frame desk capture,
+`fast` and `best` mesh outputs were visually identical despite `best`
+producing +5% verts/faces. The longer RefineMesh helps on **larger or
+more textured scenes**, not on tight desk-scale captures. Default to
+`fast` and only escalate if the mesh visibly lacks detail in regions
+where you expect surface texture.
 
 **`--mesh-quality` is the single biggest mesh-quality lever** — it controls
 OpenMVS's `RefineMesh --resolution-level`. The splat is unaffected by this
-flag, the mesh is dramatically affected.
+flag, the mesh is affected.
 
 | Setting | Maps to | RefineMesh time | Mesh sharpness |
 |---|---|---|---|
 | `fast` (default) | res-level 2 (quarter-res images) | ~5 min | Decent |
-| `high` | res-level 1 (half-res images) | ~20 min | Noticeably sharper |
-| `best` | res-level 0 (full image resolution) | ~80 min | Photographic fidelity |
+| `high` | res-level 1 (half-res images) | ~20 min | Noticeably sharper (on larger scenes) |
+| `best` | res-level 0 (full image resolution) | ~80 min on big meshes / ~18 min on desk-scale | Photographic fidelity — when it helps |
+
+**Test result on the 263-frame desk capture:** `fast` and `best` produced
+**visually identical** outputs (the +5% vert/face count in the `best`
+stats didn't translate to perceptible detail). For desk-sized scenes
+`fast` is enough. Try `high` or `best` only on:
+  - Larger scenes (whole room, building exterior)
+  - Strongly textured subjects (carved wood, fabric)
+  - When you've already maxed `--iters` and want one more knob
+
+## Cleaning floaters after training
+
+The pipeline's default prune (opacity > 0.15 + connected-component
+cleanup) removes most haze, but reflective surfaces (glossy monitors,
+windows, mirrors) can produce stubborn blobs that pass the default
+filter. The `aggressive_prune.py` script (added in v32) applies three
+extra filters without retraining:
+
+```powershell
+python aggressive_prune.py output/splat_vN_noinit_pruned.ply --use-aabb
+# Outputs: splat_vN_noinit_pruned_clean.ply
+# Filters:
+#   1. Drop top 5% largest-scale Gaussians (default --scale-pct 95)
+#   2. Stricter opacity (default --opacity-min 0.30)
+#   3. Clip to scene AABB from tof_bounds.json (--use-aabb)
+```
+
+**Caveat from V32 testing:** scale-based filtering catches some floaters
+but does NOT remove view-dependent monitor reflections that the trainer
+spawned to satisfy the photometric loss across moving reflections. Those
+blobs are inside the scene volume, at normal-ish scale, and at high
+opacity — visually indistinguishable from real geometry by post-process
+filters alone. The real fixes for reflection blobs are:
+  - Recapture with the monitors off / draped (best ROI)
+  - SAM-based screen masking + retrain (heavier infra work)
 
 ---
 
