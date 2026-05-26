@@ -8,13 +8,15 @@ same-name tag. Output artifacts live under `output/`.
 | V6  | `v6`  | splat | canonical (legacy, iPhone capture) | DA3 monocular depth → splat init |
 | V17 | `v17` | mesh  | canonical (legacy, iPhone capture) | OpenMVS Refine + texture + LOD + AO |
 | V22 | `v22` | splat | regression (kept as reference) | AGS-Mesh experiment, broke densification on gsplat 1.5 |
-| V23 | `v23` | both  | canonical for **Femto data** | Pure ToF init (Paradigm A) |
-| V24 | `v24` | both  | **best of Femto branch — current default** | Hybrid ToF + DA3 fill init + scale-calibration fix |
+| V23 | `v23` | both  | canonical for **Femto data** (129-frame capture) | Pure ToF init (Paradigm A) |
+| V24 | `v24` | both  | **best splat for 129-frame capture** | Hybrid ToF + DA3 fill init + scale-calibration fix |
 | V25 | `v25` | splat | experiment, **regression** | ags-mesh + ToF supervision (same V22 densification bug) |
 | V26 | `v26` | mesh  | experiment, no atlas | TSDF volumetric fusion (KinectFusion-style, Paradigm C) |
 | V29 | `v29` | tooling | docs + framework | ICP pose-refinement framework + scoping docs |
 | V30 | `v30` | splat | experiment, **visually worse than V24** | Real depth-supervised splatfacto-big via splat_tof plugin |
 | V31 | `v31` | mesh  | experiment, **visually worse than V24** | TSDF + custom xatlas UV baker |
+| V32 | `v32` | both  | **best splat + mesh for 263-frame recapture** | Vendor-intrinsic prior locks COLMAP focal/cx/cy, `--downscale-factor` / `--iters` / `--mesh-quality` CLI flags, `aggressive_prune.py` |
+| V33 | (local only, not pushed) | splat | experiment, **slightly worse than V32** | SAM3 monitor masking → `mask_path` in transforms.json → splatfacto excludes screen pixels from RGB loss. Trained -13% Gaussians but reflection blob persisted, scene quality marginally dropped. Code reverted; masks deleted; only docs kept. |
 
 ## Legacy (iPhone data, before Femto camera)
 
@@ -159,12 +161,104 @@ projection + flat-per-face atlas bake.
 
 Key files: `bake_tsdf_atlas.py`.
 
-## Pattern across V23-V31
+### V32 — vendor intrinsics + larger recapture (current best Femto)
+Two changes from V24:
 
-Six algorithmic experiments on this Femto desk capture, zero visual wins
-over V23/V24. The bottleneck is the data (handheld 129-frame loose sweep),
-not the pipeline. Next real improvement is a better recapture per
-`CAPTURE_GUIDE.md`, then re-running V24 + optionally V30 on the new data.
+1. **263-frame recapture** of the desk space (vs V23/V24's 129-frame
+   handheld sweep), with the in-app capture aids from `capture_femto.py`
+   (motion-auto, coverage minimap, range-zone HUD, shutter sound).
+2. **Vendor intrinsic prior**: when `nerfstudio_data/femto_intrinsics.json`
+   exists, the pipeline now passes Femto's measured PINHOLE params
+   (fx=fy≈1125.2, cx≈966.0, cy≈519.9) to COLMAP feature_extractor as
+   priors AND locks them during bundle adjustment (`refine_intrinsics=False`).
+   COLMAP no longer estimates focal/principal jointly, so SfM is faster
+   and more robust, and back-projection in `femto_to_init.py` uses the
+   measured camera rather than COLMAP's estimate.
+
+V32 also exposes three new CLI flags so a stronger GPU can be utilised:
+`--downscale-factor`, `--iters`, `--mesh-quality {fast,high,best}` — see
+`RUN_GUIDE.md`. Adds `aggressive_prune.py` for post-hoc floater cleanup
+on any trained splat.
+
+Result on the 263-frame capture:
+- COLMAP SfM finished in 5 min, 244 / 263 frames registered, **31,726
+  sparse 3D points** (5× V23's 21,295) — the bigger dataset + locked
+  intrinsics give a much denser sparse model.
+- Pruned splat: **744,650 Gaussians, 176 MB**, opacity median 0.97.
+- Mesh (HIGH, `--mesh-quality fast`): 1.17M verts / 1.84M faces / 77 MB
+  textured at 8K UV atlas.
+- Tested `--mesh-quality best` (RefineMesh res-level 0, full image
+  resolution): +5% verts/faces but **visually identical** to fast on
+  this desk-scale scene. Kept as `mesh_v32_bestmesh/` for reference but
+  `fast` is the default recommendation.
+
+User verdict: **V32 is the best splat + mesh for the 263-frame
+recapture**, V24 remains best for the original 129-frame capture.
+
+Key files: `lib/colmap_pipeline.py` (camera_model + camera_params kwargs),
+`reconstruct_realityscan.py` (reads femto_intrinsics.json), `RUN_GUIDE.md`
+(setup + transfer instructions for a beefier machine), `aggressive_prune.py`.
+
+### V33 — SAM3 monitor masking (local-only experiment, not pushed)
+**Reverted. Documented here for the historical record.** V32's pruned
+splat had a persistent dark floating blob in front of the left desk
+monitor — view-dependent reflection compensators that the trainer
+spawned to fit the moving screen reflections across frames. The fix
+suggested by a 3DGS expert was the "nuclear option": run SAM on the
+input frames, mask out the screens, feed those masks to splatfacto via
+the existing `mask_path` field in transforms.json so the RGB loss
+ignores screen pixels.
+
+What was built:
+- `generate_screen_masks.py` — SAM3 wrapper that runs prompt
+  `"computer monitor, screen, display"` over each of the 263 captures,
+  inverts to nerfstudio convention (0=ignore, 255=keep) with 8 px
+  dilation, writes PNGs to `nerfstudio_data/masks/`.
+- `lib/colmap_to_ns.py` — new `masks_dir` argument; writes per-frame
+  `mask_path` into `transforms.json` when a matching mask exists.
+- `reconstruct_realityscan.py` — auto-detects `nerfstudio_data/masks/`,
+  mirrors PNGs into `colmap/dense/masks/` (full res) + `colmap/dense/
+  masks_2/` (downscaled, nearest-neighbour to match `images_2/`),
+  passes the dir into `convert()`. Opt-in by presence of the masks
+  folder, no new CLI flag.
+
+Plumbing verified end-to-end: 263 masks generated (avg 21 % screen
+coverage per frame), 263 mirrored, 244/244 registered frames had
+`mask_path` populated in transforms.json. Splatfacto-big trained for
+~20 min on the masked dataset.
+
+Result vs V32:
+- V33 trained **-11 %** raw Gaussians (1.45 M → 1.29 M)
+- V33 pruned **-13 %** Gaussians (745 K → 647 K) → 153 MB pruned splat
+- Opacity / scale distributions essentially unchanged
+- That ~100 K Gaussian gap was likely the reflection-blob population
+
+User visual verdict: **V33 is slightly WORSE than V32** — the reflection
+blob is still there, scene quality dropped marginally in non-screen
+regions. Likely root cause: the blob is partly seeded by ToF IR ghosts
+(the 850 nm IR partially mirrors off glossy screens, putting phantom
+points in `tof_init.ply`), which masking the RGB loss can't undo.
+Masking screen pixels also removes valid supervision for the screen
+surface itself, slightly hurting adjacent geometry.
+
+**Conclusion: SAM3 masking is not the silver bullet for reflection
+artifacts.** The most practical fix for screen-reflection scenes is
+either (a) recapture with the monitors off / draped, or (b) clip
+`tof_init.ply` against a monitor AABB before splat training. V33 code
+was reverted; the V33 docs + memory note remain so this doesn't get
+re-tried without a different angle.
+
+Key files (all local, NOT in any pushed commit): `generate_screen_masks.py`,
+plus the `masks_dir` plumbing reverts in `lib/colmap_to_ns.py` and
+`reconstruct_realityscan.py`.
+
+## Pattern across V23-V33
+
+Seven algorithmic experiments on this Femto desk capture, zero visual
+wins over V23/V24/V32. The bottleneck is the data (reflective monitors,
+handheld sweep), not the pipeline. Next real improvement is a recapture
+of the scene with monitors off / draped, per `CAPTURE_GUIDE.md`, then
+re-running V32 on the new data.
 
 ## Quick reference: where to start
 
