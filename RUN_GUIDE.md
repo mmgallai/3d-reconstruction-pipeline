@@ -305,6 +305,95 @@ filters alone. The real fixes for reflection blobs are:
 
 ---
 
+## Per-object extraction (Unity / Quest 3 deliverables)
+
+Once you have the scene-level splat + textured mesh from the main pipeline,
+the **scene segmenter** crops Unity-ready per-object splats + meshes by
+text prompt. Fully automated, no manual Blender work. Used for the VR
+digital-twin grab-interaction targets.
+
+### Current canonical chain (V32 data3)
+
+```
+SAM3 masks (cached)                   <- pipeline.py (~5 min, GPU)
+   |
+   v
+v9a_fp_v2 mesh per object             <- _spatial_crop.py     (~100 s, CPU)
+   |
+   v
+v5_shcolor splat per object           <- _spatial_crop_splat.py (~30 s, CPU)
+   |
+   v
+v6_cleaned splat per object  (FINAL)  <- _clean_splat.py      (~5-15 s/object, CPU)
+```
+
+Each stage feeds the next; outputs land in
+`output/segmented_<scene>_v9a_fp_v2*/`. Deep design notes + version
+graveyard in [SCENE_SEGMENTER_NOTES.md](SCENE_SEGMENTER_NOTES.md).
+
+### Production commands (V32 data3 defaults)
+
+```powershell
+# 1. SAM3 voting + voxel-CC seeds -> v9a_fp_v2 per-object mesh
+conda run -n sam3 python -m scene_segmenter.pipeline `
+  --mesh output/mesh_v32_data3/mesh_v32_data3_openmvs.ply `
+  --atlas output/mesh_v32_data3/scene_textured0.png `
+  --project-root . `
+  --prompts "white water bottle,blue box,red lobster figurine" `
+  --output-dir output/segmented_v32_data3_v9a_fp_v2
+
+conda run -n sam3 python _spatial_crop.py --mode a `
+  --output-dir output/segmented_v32_data3_v9a_fp_v2 `
+  --crop-style footprint --xz-dilate-cm 0.5 --y-margin-cm 0.5 `
+  --seed-threshold 0.7 --no-remainder
+
+# 2. Footprint crop on the scene splat -> v5_shcolor per-object splat
+conda run -n sam3 python _spatial_crop_splat.py `
+  --splat output/splat_v32_data3_noinit_pruned.ply `
+  --dataparser nerfstudio/dense/splatfacto/<run>/dataparser_transforms.json `
+  --segmented-dir output/segmented_v32_data3_v9a_fp_v2 `
+  --prompts "white water bottle,blue box,red lobster figurine" `
+  --output-dir output/segmented_v32_data3_v9a_fp_v2_splat_v5_shcolor `
+  --crop-style footprint --xz-dilate-cm 0.5 --y-margin-cm 0.5 `
+  --exclude-color "124,113,71" --color-tolerance 18 --sh-view-dir "0,0,1"
+
+# 3. Clean-GS pruning on the v5_shcolor crops -> v6_cleaned (FINAL)
+conda run -n sam3 python _clean_splat.py
+```
+
+`_clean_splat.py` has every V32 data3 default baked in — just `python _clean_splat.py`
+reproduces the production output. For another scene, override `--splat-dir`,
+`--cameras`, `--sam3-cache`, `--photo-dir`, `--output-dir`, `--prompts`.
+
+### Per-object outputs
+
+```
+output/segmented_<scene>_v9a_fp_v2/<prompt_slug>/
+├── <prompt>_extracted.obj/.mtl/.png    <- Unity (OBJ+MTL+PNG; most reliable)
+├── <prompt>_extracted.ply              <- VCG textured PLY (MeshLab)
+├── <prompt>_extracted.glb              <- Single-file Unity / Blender
+└── <prompt>_extracted_collider.json    <- AABB / OBB / convex hull + recommended Unity collider
+
+output/segmented_<scene>_v9a_fp_v2_splat_v6_cleaned/
+└── <prompt>_splat.ply                  <- Final per-object Gaussian splat (FINAL)
+```
+
+The per-object splat is in the same nerfstudio PLY schema as the scene
+splat (positions / normals / SH coefficients / opacity / scales /
+rotations) — drop-in loadable by SuperSplat, Aras-P Unity splat plugin,
+Three.js gsplat viewers, and Babylon's `GaussianSplattingMesh`.
+
+### Why v6_cleaned beats v5_shcolor
+
+Measured on V32 data3: v6 prunes 12–19 % of Gaussians per object,
+**bounding box unchanged**, slight rise in per-Gaussian opacity confidence
+(lobster +2.5 pp), and 12–19 % smaller files. The prunes are real floaters
+(the fuzzy fringe around the bottle base / lobster claws / box edges),
+not surface erosion. v5 remains a useful fallback if Clean-GS over-prunes
+on a new scene — just skip stage 3.
+
+---
+
 ## Pipeline stages — what happens when you run it
 
 1. **Stage 1 — HEIC→JPEG** (skipped when `--use-femto-depth`)
@@ -405,4 +494,10 @@ conda run -n da3 python tsdf_fusion_femto.py
 
 # Custom UV-atlas baker for TSDF meshes (unblocks the V27 attempt)
 conda run -n da3 python bake_tsdf_atlas.py
+
+# Per-object extraction (Unity / Quest 3) -- after the main pipeline finishes
+conda run -n sam3 python -m scene_segmenter.pipeline --prompts "white water bottle,..."
+conda run -n sam3 python _spatial_crop.py --mode a --crop-style footprint
+conda run -n sam3 python _spatial_crop_splat.py [...args]
+conda run -n sam3 python _clean_splat.py    # final v6_cleaned splats
 ```
