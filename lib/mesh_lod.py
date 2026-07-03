@@ -6,66 +6,42 @@ Produces three levels by default:
   MID   — ~500K faces (good for desktop/mobile WebGL)
   LOW   — ~100K faces (mobile / very fast load)
 
-Each LOD is saved as both .glb (compact, web-ready) and .ply (compatibility).
+Each LOD is saved as a textured binary PLY preserving UVs.
 
-Usage:
-    python lib/mesh_lod.py <input.ply> <output_dir> [--mid 500000 --low 100000]
-
-The texture atlases are NOT re-baked — the LOD meshes preserve UVs (best
-effort via quadric edge collapse) and reference the same scene_textured*.png
-files. Quadric decimation can stretch UVs slightly; for very low LODs the
-visual quality drops.
-
-Designed to be invoked via `conda run -n da3 python lib/mesh_lod.py ...`.
+Designed to be invoked via `conda run -n da3 python lib/mesh_lod.py ...` or direct python.
 """
 import argparse
 import sys
+import shutil
 from pathlib import Path
-
-import numpy as np
-import open3d as o3d
+import pymeshlab as ml
 
 
-def make_lod(verts: np.ndarray, faces: np.ndarray,
-             target_faces: int) -> tuple[np.ndarray, np.ndarray]:
-    """Open3D quadric edge-collapse decimation to a target face count."""
-    if len(faces) <= target_faces:
-        print(f"  [{target_faces:,} target] mesh already at/under target ({len(faces):,}); skipping", flush=True)
-        return verts, faces
-    m = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(verts.astype(np.float64)),
-        o3d.utility.Vector3iVector(faces.astype(np.int32)),
+def make_lod(in_path: Path, out_path: Path, target_faces: int) -> None:
+    """Decimate the mesh using PyMeshLab's SOTA quadric edge-collapse simplification, preserving UVs."""
+    print(f"Decimating to {target_faces:,} faces ...", flush=True)
+    ms = ml.MeshSet()
+    ms.load_new_mesh(str(in_path))
+    
+    m_in = ms.current_mesh()
+    face_count = m_in.face_number()
+    if face_count <= target_faces:
+        print(f"  [{target_faces:,} target] mesh already at/under target ({face_count:,}); copying", flush=True)
+        shutil.copy2(in_path, out_path)
+        return
+        
+    # Simplify using PyMeshLab's quadric edge collapse decimation filter with texture.
+    # This ensures the face-varying (wedge) UV atlas coordinates are correctly simplified.
+    ms.apply_filter(
+        "meshing_decimation_quadric_edge_collapse_with_texture",
+        targetfacenum=target_faces,
+        preservenormal=True
     )
-    out = m.simplify_quadric_decimation(target_number_of_triangles=target_faces)
-    out.remove_duplicated_vertices()
-    out.remove_duplicated_triangles()
-    out.remove_unreferenced_vertices()
-    nv = np.asarray(out.vertices)
-    nf = np.asarray(out.triangles)
-    print(f"  [{target_faces:,} target] decimated: {len(faces):,} → {len(nf):,} faces  "
-          f"({len(verts):,} → {len(nv):,} verts)", flush=True)
-    return nv, nf
-
-
-def write_ply(path: Path, verts: np.ndarray, faces: np.ndarray) -> None:
-    """Write a minimal binary PLY (positions + faces, no UVs/textures)."""
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {len(verts)}\n"
-        "property float x\nproperty float y\nproperty float z\n"
-        f"element face {len(faces)}\n"
-        "property list uchar int vertex_indices\n"
-        "end_header\n"
-    )
-    with open(path, "wb") as fh:
-        fh.write(header.encode("ascii"))
-        fh.write(verts.astype(np.float32).tobytes())
-        # face records: 1 uchar count + 3 ints
-        face_data = np.empty(len(faces), dtype=[("count", "u1"), ("vidx", "<i4", 3)])
-        face_data["count"] = 3
-        face_data["vidx"] = faces.astype(np.int32)
-        fh.write(face_data.tobytes())
+    
+    ms.save_current_mesh(str(out_path), binary=True)
+    m_out = ms.current_mesh()
+    print(f"  [{target_faces:,} target] decimated: {face_count:,} -> {m_out.face_number():,} faces  "
+          f"({m_in.vertex_number():,} -> {m_out.vertex_number():,} verts)", flush=True)
 
 
 def main() -> int:
@@ -80,25 +56,23 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading {in_path} ...", flush=True)
-    m_o3d = o3d.io.read_triangle_mesh(str(in_path))
-    verts = np.asarray(m_o3d.vertices)
-    faces = np.asarray(m_o3d.triangles)
-    print(f"  source: {len(verts):,} verts / {len(faces):,} faces", flush=True)
+    if not in_path.exists():
+        print(f"ERROR: input file not found: {in_path}", file=sys.stderr)
+        return 1
 
-    stem = in_path.stem  # e.g. mesh_v17_openmvs
+    stem = in_path.stem  # e.g. mesh_v32_openmvs
 
     # MID LOD
-    v_mid, f_mid = make_lod(verts, faces, args.mid)
     p_mid = out_dir / f"{stem}_mid.ply"
-    write_ply(p_mid, v_mid, f_mid)
-    print(f"  saved: {p_mid.name}  ({p_mid.stat().st_size/1024/1024:.1f} MB)", flush=True)
+    make_lod(in_path, p_mid, args.mid)
+    if p_mid.exists():
+        print(f"  saved: {p_mid.name}  ({p_mid.stat().st_size/1024/1024:.1f} MB)", flush=True)
 
     # LOW LOD
-    v_low, f_low = make_lod(verts, faces, args.low)
     p_low = out_dir / f"{stem}_low.ply"
-    write_ply(p_low, v_low, f_low)
-    print(f"  saved: {p_low.name}  ({p_low.stat().st_size/1024/1024:.1f} MB)", flush=True)
+    make_lod(in_path, p_low, args.low)
+    if p_low.exists():
+        print(f"  saved: {p_low.name}  ({p_low.stat().st_size/1024/1024:.1f} MB)", flush=True)
 
     return 0
 

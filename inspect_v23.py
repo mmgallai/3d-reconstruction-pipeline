@@ -39,7 +39,7 @@ def load_splat(path):
 
 
 def splat_stats(name, path):
-    print(f"\n{'─'*78}\n{name}  ({path.name}, {path.stat().st_size/1_048_576:.1f} MB)")
+    print(f"\n{'-'*78}\n{name}  ({path.name}, {path.stat().st_size/1_048_576:.1f} MB)")
     n, p = load_splat(path)
     x, y, z = p["x"], p["y"], p["z"]
     bb = np.array([x.max() - x.min(), y.max() - y.min(), z.max() - z.min()])
@@ -65,7 +65,7 @@ def splat_stats(name, path):
     print(f"  Max-scale median  : {np.median(max_scale):>14.5f}")
     print(f"  Max-scale >1.0 (%): {100*np.mean(max_scale>1.0):>14.2f}  (large/blur)")
     print(f"  Max-scale <0.001  : {100*np.mean(max_scale<0.001):>14.2f}  (tiny/noise)")
-    print(f"  Outliers >5σ      : {out5sigma:>14,}  ({100*out5sigma/(3*n):.2f}% avg per-axis)")
+    print(f"  Outliers >5sigma  : {out5sigma:>14,}  ({100*out5sigma/(3*n):.2f}% avg per-axis)")
 
     return dict(
         name=name, gaussians=n, bb_diag=float(np.linalg.norm(bb)),
@@ -82,8 +82,24 @@ def splat_stats(name, path):
 # ── Mesh inspection via trimesh ───────────────────────────────────────────────
 
 def mesh_stats(name, path):
-    print(f"\n{'─'*78}\n{name}  ({path.name}, {path.stat().st_size/1_048_576:.1f} MB)")
-    m = trimesh.load(str(path), force="mesh", process=False)
+    print(f"\n{'-'*78}\n{name}  ({path.name}, {path.stat().st_size/1_048_576:.1f} MB)")
+    has_uv = False
+    has_vc = False
+    try:
+        m = trimesh.load(str(path), force="mesh", process=False)
+        has_uv = hasattr(m.visual, "uv") and m.visual.uv is not None
+        has_vc = (m.visual is not None and hasattr(m.visual, "vertex_colors")
+                  and m.visual.vertex_colors is not None
+                  and len(m.visual.vertex_colors) > 0)
+    except Exception as e:
+        import open3d as o3d
+        o3d_m = o3d.io.read_triangle_mesh(str(path))
+        m = trimesh.Trimesh(vertices=np.asarray(o3d_m.vertices), 
+                            faces=np.asarray(o3d_m.triangles), 
+                            process=False)
+        has_uv = o3d_m.has_triangle_uvs()
+        has_vc = o3d_m.has_vertex_colors()
+
     v, f = m.vertices, m.faces
     bb = v.max(0) - v.min(0)
     edges_ct = np.unique(m.edges_sorted, axis=0, return_counts=True)[1]
@@ -91,14 +107,6 @@ def mesh_stats(name, path):
     nm       = int((edges_ct > 2).sum())
     cc = trimesh.graph.connected_components(m.face_adjacency, min_len=1)
     largest = max(len(c) for c in cc)
-
-    has_uv = hasattr(m.visual, "uv") and m.visual.uv is not None
-    try:
-        has_vc = (m.visual is not None and hasattr(m.visual, "vertex_colors")
-                  and m.visual.vertex_colors is not None
-                  and len(m.visual.vertex_colors) > 0)
-    except Exception:
-        has_vc = False
 
     print(f"  Vertices              : {len(v):>14,}")
     print(f"  Faces                 : {len(f):>14,}")
@@ -142,7 +150,7 @@ def main():
     # Splat summary
     print(f"\n\n{'SPLAT SUMMARY':^78}\n{'='*78}")
     print(f"  {'Run':<12} {'Gauss':>12} {'Size MB':>9} {'Op mean':>9} "
-          f"{'Float %':>8} {'Solid %':>8} {'Big %':>7} {'5σ %':>6}")
+          f"{'Float %':>8} {'Solid %':>8} {'Big %':>7} {'5sig %':>6}")
     for r in s_results:
         print(f"  {r['name']:<12} {r['gaussians']:>12,} {r['size_mb']:>9.1f} "
               f"{r['opacity_mean']:>9.3f} {r['floater_pct']:>8.2f} "
@@ -152,10 +160,13 @@ def main():
     mesh_targets = [
         ("V32 fast HIGH", ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs.ply"),
         ("V32 best HIGH", ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs.ply"),
+        ("V34 fast HIGH", ROOT / "output" / "mesh_v34" / "mesh_v34_openmvs.ply"),
         ("V32 fast MID",  ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs_mid.ply"),
         ("V32 best MID",  ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs_mid.ply"),
+        ("V34 fast MID",  ROOT / "output" / "mesh_v34" / "mesh_v34_openmvs_mid.ply"),
         ("V32 fast LOW",  ROOT / "output" / "mesh_v32" / "mesh_v32_openmvs_low.ply"),
         ("V32 best LOW",  ROOT / "output" / "mesh_v32_bestmesh" / "mesh_v32_bestmesh_openmvs_low.ply"),
+        ("V34 fast LOW",  ROOT / "output" / "mesh_v34" / "mesh_v34_openmvs_low.ply"),
     ]
     m_results = []
     for label, p in mesh_targets:

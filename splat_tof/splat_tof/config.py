@@ -45,7 +45,7 @@ splatfacto_tof = MethodSpecification(
                 stop_split_at=25000,
                 densify_grad_thresh=0.0006,
                 # Depth-supervision knobs (defined in SplatfactoTofModelConfig).
-                depth_lambda=0.2,
+                depth_lambda=0.02,
                 depth_min=0.05,
                 depth_max=10.0,
             ),

@@ -225,6 +225,17 @@ def main():
         # ToF range mask (in Femto-metric, BEFORE scale-up to COLMAP units)
         tof_valid = conf & (depth >= args.min_depth) & (depth <= args.max_depth)
 
+        # SOTA: Prune retroreflective monitor IR ghosts. Active IR ToF sensors 
+        # suffer from multipath mirror reflections on shiny glass screens, returning 
+        # saturated/high intensity returns (e.g. >60,000 in 16-bit).
+        ir_path = depths_dir / f"{stem}_ir.png"
+        if ir_path.exists() and cv2 is not None:
+            ir_img = cv2.imread(str(ir_path), cv2.IMREAD_UNCHANGED)
+            if ir_img is not None:
+                if ir_img.shape != depth.shape:
+                    ir_img = cv2.resize(ir_img, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST)
+                tof_valid = tof_valid & (ir_img < 60000)
+
         # ── Hybrid: build a per-pixel depth map combining ToF + DA3 fallback
         if args.use_da3_fallback:
             da3_path = da3_depths_dir / f"{stem}.npy"

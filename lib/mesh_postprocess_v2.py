@@ -59,7 +59,7 @@ def main(in_path: Path, out_path: Path,
     m.remove_triangles_by_index(drop_idx)
     m.remove_unreferenced_vertices()
     v1, f1 = len(m.vertices), len(m.triangles)
-    print(f"  after component filter: {v1:,} verts / {f1:,} faces  (Δ {v1-v0:+,} verts, {f1-f0:+,} faces)", flush=True)
+    print(f"  after component filter: {v1:,} verts / {f1:,} faces  (delta {v1-v0:+,} verts, {f1-f0:+,} faces)", flush=True)
 
     # 2) Consistent face winding (replaces trimesh.fix_normals — works on multi-shell)
     print("Orienting triangles consistently ...", flush=True)
@@ -78,7 +78,7 @@ def main(in_path: Path, out_path: Path,
         v_after = out.vertex_matrix().astype(np.float32)
         f_after = out.face_matrix().astype(np.int32)
         v2, f2 = len(v_after), len(f_after)
-        print(f"  after close_holes: {v2:,} verts / {f2:,} faces  (Δ {v2-v1:+,} verts, {f2-f1:+,} faces)", flush=True)
+        print(f"  after close_holes: {v2:,} verts / {f2:,} faces  (delta {v2-v1:+,} verts, {f2-f1:+,} faces)", flush=True)
     except Exception as e:
         print(f"  WARN: close_holes failed: {e}; using mesh without hole closing", flush=True)
         v_after = verts.astype(np.float32)

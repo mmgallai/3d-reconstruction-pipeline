@@ -282,8 +282,9 @@ stats didn't translate to perceptible detail). For desk-sized scenes
 The pipeline's default prune (opacity > 0.15 + connected-component
 cleanup) removes most haze, but reflective surfaces (glossy monitors,
 windows, mirrors) can produce stubborn blobs that pass the default
-filter. The `aggressive_prune.py` script (added in v32) applies three
-extra filters without retraining:
+filter. Two scripts apply extra post-training filters without retraining.
+
+### `aggressive_prune.py` (v1 — original, kept for back-compat)
 
 ```powershell
 python aggressive_prune.py output/splat_vN_noinit_pruned.ply --use-aabb
@@ -294,6 +295,100 @@ python aggressive_prune.py output/splat_vN_noinit_pruned.ply --use-aabb
 #   3. Clip to scene AABB from tof_bounds.json (--use-aabb)
 ```
 
+**Known bug, fixed in v2:** the v1 AABB filter reads bounds in COLMAP
+units but compares them against PLY positions in splat-space (~9× smaller
+on V32 after the dataparser transform). Net effect: only the Z axis ends
+up doing any cropping, and even that is largely an arbitrary half-space
+cut rather than a desk-shaped box. The "leafy" peripheral fringe you see
+around V32 renders is what survives the broken v1 AABB.
+
+### `aggressive_prune_v2.py` (2026-06-22 — superseded by v3, kept for reference)
+
+Same scale + opacity defaults; the AABB step is rewritten to work
+entirely in splat-space and to **auto-derive** the keep-box from the
+per-object splats the segmenter already produced. No coordinate-frame
+bugs, no hardcoded numbers.
+
+**Known issue (fixed in v3):** the union of per-object splats only
+covers the central desk area. The back wall and the desk's far edges
+are clipped because no object sits against them. On V32 this kept
+only 44 % of Gaussians and visibly cut into legitimate scene content.
+
+```powershell
+python aggressive_prune_v2.py output/splat_vN_noinit_pruned.ply
+# Outputs: splat_vN_noinit_pruned_cleaned_v2.ply
+# Filters:
+#   1. Drop top 5% largest-scale Gaussians (--scale-pct 95)
+#   2. Stricter opacity (--opacity-min 0.30)
+#   3. SPLAT-SPACE AABB clip (--auto-aabb ON by default):
+#      - Takes union of per-object PLYs in
+#        output/segmented_<scene>_v9a_fp_v2_splat_v6_cleaned/
+#      - Expands by 30 cm metric margin (--margin-m 0.30)
+#      - Clips to that box -- guaranteed same frame as the splat
+```
+
+Manual override paths (when you don't have a segmenter run, or want a
+specific box):
+
+```powershell
+# Explicit 6-arg AABB:
+python aggressive_prune_v2.py <in.ply> `
+  --aabb-x-min -1.1 --aabb-x-max 0.8 `
+  --aabb-y-min  0.55 --aabb-y-max 1.2 `
+  --aabb-z-min -0.65 --aabb-z-max 0.15
+
+# JSON box (same schema as the 6 args):
+python aggressive_prune_v2.py <in.ply> --aabb-json desk_box.json
+
+# Disable AABB entirely (scale + opacity only):
+python aggressive_prune_v2.py <in.ply> --no-aabb
+```
+
+**V32 result (v2):** 226,665 → 99,733 Gaussians (44 % kept; 53.6 MB → 23.6 MB).
+On visual inspection the box was too tight: clipped the back wall and
+the desk's far edges. Hence v3.
+
+### `aggressive_prune_v3.py` (recommended, 2026-06-23)
+
+Derives the AABB from the **scene MESH vertices** (`output/mesh_<scene>/mesh_<scene>_openmvs.ply`)
+instead of the per-object splats. The scene mesh is the faithful 3D
+reconstruction of the desk + back wall + everything OpenMVS could
+actually triangulate — and floaters do NOT exist in the mesh because
+they have no real geometry. So the mesh's spatial extent IS the
+"everything real" box, by construction.
+
+Algorithm:
+  1. Load scene mesh vertices in metric world.
+  2. Forward-transform to splat-space via `dataparser_transforms.json`.
+  3. Take a 1st–99th percentile AABB per axis (drops a few stray
+     OpenMVS outlier faces).
+  4. Expand by a small 10 cm metric margin (already scene-tight).
+  5. Run same scale + opacity prune as v1/v2.
+  6. Clip Gaussians outside the splat-space AABB.
+
+```powershell
+python aggressive_prune_v3.py output/splat_v32_data3_noinit_pruned.ply
+# Outputs: splat_v32_data3_noinit_pruned_cleaned_v3.ply
+
+# Knobs (defaults shown):
+#   --scale-pct 95           drop top-5% largest Gaussians
+#   --opacity-min 0.30       drop low-opacity haze
+#   --aabb-percentile 1.0    use 1st-99th percentile of mesh verts
+#   --margin-m 0.10          expand AABB by 10 cm metric on each axis
+#   --no-aabb                disable the AABB step entirely
+```
+
+**V32 result (v3):** 226,665 → 153,752 Gaussians (68 % kept; 53.6 MB → 36.4 MB).
+AABB step drops just 20,097 Gaussians (the floaters outside the
+reconstructed-scene envelope), versus v2's 74 k. Back wall + desk
+perimeter preserved.
+
+**When to use v2 vs v3:**
+- v3 needs the scene mesh + dataparser_transforms.json. If you have
+  those (anyone running the standard V32 pipeline does) → use v3.
+- v2 only needs the per-object splats. If you ran the segmenter
+  but didn't build a scene mesh, v2 is a fallback.
+
 **Caveat from V32 testing:** scale-based filtering catches some floaters
 but does NOT remove view-dependent monitor reflections that the trainer
 spawned to satisfy the photometric loss across moving reflections. Those
@@ -302,6 +397,7 @@ opacity — visually indistinguishable from real geometry by post-process
 filters alone. The real fixes for reflection blobs are:
   - Recapture with the monitors off / draped (best ROI)
   - SAM-based screen masking + retrain (heavier infra work)
+  - SpotLessSplats robust masking (training-time, on the roadmap)
 
 ---
 

@@ -223,30 +223,37 @@ def poisson_reconstruct_mesh(project_root: Path, depth: int = 11,
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 3b — PostProcess (NEW in Tier 1, host Python)
 # ─────────────────────────────────────────────────────────────────────────────
-def mesh_postprocess(project_root: Path, min_component_faces: int = 100) -> bool:
+def mesh_postprocess(project_root: Path, min_component_faces: int = 100,
+                     src_name: str = "scene_mesh.ply", dst_name: str = "scene_mesh_clean.ply") -> bool:
     """
-    Clean ReconstructMesh's output before texturing:
+    Clean mesh output before texturing:
       • Drop connected components smaller than `min_component_faces`
         (kills the thousands of tiny floating fragments).
       • Fix winding (uniform outward normals — recovers a positive volume).
-      • Fill small triangle/quad holes (trimesh.repair.fill_holes).
+      • Fill small triangle/quad holes (pymeshlab close_holes).
 
-    Reads:  openmvs/scene_mesh.ply
-    Writes: openmvs/scene_mesh_clean.ply
+    Reads:  openmvs/<src_name>
+    Writes: openmvs/<dst_name>
     """
-    logger.info(f"=== OpenMVS [3b/5]  PostProcess (v2: pymeshlab close_holes) ===")
-    src = project_root / _OPENMVS_DIR_REL / "scene_mesh.ply"
-    dst = project_root / _OPENMVS_DIR_REL / "scene_mesh_clean.ply"
+    logger.info(f"=== OpenMVS PostProcess {src_name} -> {dst_name} (v2: pymeshlab close_holes) ===")
+    src = project_root / _OPENMVS_DIR_REL / src_name
+    dst = project_root / _OPENMVS_DIR_REL / dst_name
 
     # mesh_postprocess_v2.py: pymeshlab close_holes (handles arbitrary hole sizes)
     # + Open3D orient_triangles (multi-shell winding).  Falls back to v1 if missing.
     script_v2 = project_root / "lib" / "mesh_postprocess_v2.py"
     script = script_v2 if script_v2.exists() else (project_root / "lib" / "mesh_postprocess.py")
-    res = subprocess.run(
-        ["conda", "run", "-n", "da3", "--no-capture-output",
-         "python", str(script), str(src), str(dst), str(min_component_faces), "300"],
-        capture_output=True, text=True,
-    )
+    
+    # Run using the robust direct da3 env python if available to bypass Conda run CLI issues on Windows
+    import os
+    python_exe = "C:\\Users\\mgallai\\AppData\\Local\\miniconda3\\envs\\da3\\python.exe"
+    if os.path.exists(python_exe):
+        cmd = [python_exe, str(script), str(src), str(dst), str(min_component_faces), "300"]
+    else:
+        cmd = ["conda", "run", "-n", "da3", "--no-capture-output",
+               "python", str(script), str(src), str(dst), str(min_component_faces), "300"]
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
     if res.stdout:
         for line in res.stdout.splitlines():
             logger.info(line)
@@ -469,6 +476,25 @@ def run_full_mesh_pipeline(project_root: Path,
             textured_input = "scene_mesh_refine.ply"
         else:
             logger.warning("OpenMVS: RefineMesh failed — using un-refined mesh.")
+
+    # ── Stage 4b: Post-process refined mesh (heals RefineMesh fragmentation) ──
+    if do_refine and textured_input == "scene_mesh_refine.ply":
+        scene_mesh_refine_clean = omvs / "scene_mesh_refine_clean.ply"
+        # Overwrite if forced or if clean refined mesh is missing/outdated
+        need_repost = (not scene_mesh_refine_clean.exists() 
+                       or force_refine
+                       or scene_mesh_refine_clean.stat().st_mtime < (omvs / "scene_mesh_refine.ply").stat().st_mtime)
+        if need_repost:
+            logger.info("=== OpenMVS [4b/5] PostProcess refined mesh (heals RefineMesh fragmentation) ===")
+            # Use min_component_faces=250 to aggressively prune refinement-induced floaters
+            if mesh_postprocess(project_root, min_component_faces=250, 
+                                src_name="scene_mesh_refine.ply", dst_name="scene_mesh_refine_clean.ply"):
+                textured_input = "scene_mesh_refine_clean.ply"
+            else:
+                logger.warning("OpenMVS: PostProcess on refined mesh failed — texturing un-cleaned refined mesh instead.")
+        else:
+            logger.info("=== OpenMVS [4b/5] scene_mesh_refine_clean.ply cached — skipping post-refine PostProcess ===")
+            textured_input = "scene_mesh_refine_clean.ply"
 
     # ── Stage 5: TextureMesh ────────────────────────────────────────────────
     # Auto-pick image resolution level: dense meshes (>10M faces) crash the

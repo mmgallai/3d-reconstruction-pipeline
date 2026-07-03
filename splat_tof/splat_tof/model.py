@@ -21,7 +21,7 @@ class SplatfactoTofModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: SplatfactoTofModel)
     output_depth_during_training: bool = True
     """Splatfacto needs to render depth during training for the depth loss."""
-    depth_lambda: float = 0.2
+    depth_lambda: float = 0.02
     """Weight on the L1 depth loss. 0.0 disables it (= vanilla splatfacto)."""
     depth_min: float = 0.05
     """Pixels with gt depth below this are treated as invalid (in metres)."""

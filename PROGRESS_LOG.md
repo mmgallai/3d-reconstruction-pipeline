@@ -295,6 +295,197 @@ Workflow output dump: `C:\Users\mgallai\AppData\Local\Temp\claude\<session>\task
 - SCENE_SEGMENTER_NOTES.md updated to mark `v6_cleaned` as production pick
   and add the Stage B section + CLI.
 
+**Track 1 (COMPREHENSIVE_PLAN) — Truly-unseen core measurement DONE (2026-06-18)**
+- Script: [`_unseen_core_map.py`](_unseen_core_map.py). Casts rays from every captured
+  view through a 5 mm desk-plane grid under each object's XZ footprint; counts how
+  many views had unobstructed line of sight. Uses scene_segmenter's V32ViewSource +
+  Open3D BVH raycaster over the V32 OpenMVS mesh.
+- **Critical knob discovered:** per-object extracted-mesh `y_min` is NOT a reliable
+  desk plane for objects whose contact base was occluded during capture (box's
+  extracted-mesh bottom is 12 cm above the actual desk because OpenMVS couldn't
+  reconstruct the under-box geometry). Use `--desk-y 0.002` (V32 desk surface,
+  taken from the bottle's well-reconstructed base) for all objects on the V32 desk.
+- **Result (140 views, 5 mm grid):**
+
+  | Object | Truly unseen | < 5 views | >= 20 views | median views/pt |
+  |---|---|---|---|---|
+  | white_water_bottle | 0.1 % (1/1204) | 0.2 % | 99.6 % | 120 |
+  | blue_box | 0.0 % (0/960) | 0.0 % | 100.0 % | 126 |
+  | red_lobster_figurine | 10.8 % (118/1088) | 14.2 % | 79.0 % | 64 |
+
+- **Plan-level decision:** every object < 30 % unseen → **NN-copy from observed
+  footprint is sufficient for V32 data3**. Skip Track 2a M2 (LaMa) and Track 2b
+  (GSFix3D off-the-shelf). The full diffusion path is no longer load-bearing.
+- Lobster's 10.8 % unseen is one contiguous triangular shadow under the body;
+  surrounding ring is well-observed → NN extrapolation will give uniform desk
+  colour, perfectly adequate for VR.
+- Outputs at `output/unseen_core_v32_data3/`: per-object heatmap PNG + grid NPZ
+  (positions + per-point view count) for downstream patch-Gaussian seeding.
+
+**Track 2a (COMPREHENSIVE_PLAN, modified post-Track-1) — desk-patch Gaussian seeder DONE (2026-06-18)**
+- Script: [`_seed_desk_patch.py`](_seed_desk_patch.py). Unified M1+M2+M3 (no LaMa
+  diffusion needed at V32's <30% unseen regime).
+- Per grid point: visibility-pass + best-view scoring (cos(off-normal) / distance)
+  → bilinear RGB sample from that view's source photo; truly-unseen points get
+  SciPy `cKDTree` NN-copy from the nearest observed point.
+- Bug caught early: initial best_score=-1 made every point claim a "best view"
+  even at score 0 (visible=False), bypassing NN-copy. Fixed by gating
+  `better = visible & (score > best_score)`. Now NN-copy fires for the 118
+  lobster unseen points as expected.
+- Output: per-object splat-space PLY at `output/desk_patch_v32_data3/desk_patch_<slug>.ply`.
+  Schema matches existing v6_cleaned (SH degree 3 zero-padded, same property order).
+- Transform chain verified: metric `(x, y_desk, z)` → COLMAP-units → splat space
+  via dataparser_transforms.json (R, t, dp_scale=0.17306; bottle base maps to
+  splat Y≈0.83, splat Z≈0.04 — matches v6 bottle splat's high-Z end exactly).
+- Desk normal in splat space: `[0.051, 0.064, -0.997]` (≈ -Z); patch quaternion
+  `(0.73, -0.683, 0, -0.035)` aligns Gaussian local +Y with that normal.
+- Patch sizes: bottle 1,204 Gaussians (293 KB), box 960 (234 KB), lobster
+  1,088 (265 KB) — additive to the V32 scene splat (227k) is < 2 % overhead.
+- **Track 2a M4 (localized splatfacto retraining) NOT YET tested** — first
+  step is a visual check: render a held-out view through `V32 scene splat MINUS
+  object + patch` to see whether the seeded patch already looks plausible
+  without retraining. If yes, M4 can be skipped entirely.
+- **Track 2a deliverable scenes** generated via [`_merge_patched_scene.py`](_merge_patched_scene.py):
+  takes V32 scene splat (`splat_v32_data3_noinit_pruned.ply`, 227k Gaussians),
+  removes Gaussians inside each object's v9a_fp_v2 footprint, splices in the
+  desk-patch. Outputs at `output/scene_patched_v32_data3/`:
+
+  | File | Gaussians | Size | What |
+  |---|---|---|---|
+  | `scene_patched_white_water_bottle.ply` | 222,438 | 52.6 MB | scene minus bottle + desk patch |
+  | `scene_patched_blue_box.ply` | 222,255 | 52.6 MB | scene minus box + desk patch |
+  | `scene_patched_red_lobster_figurine.ply` | 225,247 | 53.3 MB | scene minus lobster + desk patch |
+  | `scene_patched_ALL.ply` | 216,610 | 51.2 MB | scene minus all 3 + 3 desk patches |
+
+- **Open these in SuperSplat to visually verify**: the desk surface under each
+  removed object should now be present (no visible hole). If the patches look
+  flat/cardboard-like (esp. lobster's 10.8 % NN-copied region), run M4 to
+  polish. If they already blend cleanly, M4 is unnecessary.
+
+**Phase: trim + inpaint -- mesh-side mirror DONE (2026-06-18)**
+- Orchestrator: [`_phase_trim_inpaint.py`](_phase_trim_inpaint.py). Produces
+  apples-to-apples splat-and-mesh deliverables under one root.
+- **Mesh trim**: `_trim_mesh_by_footprint()` drops scene-mesh faces whose
+  centroids fall inside the same XZ footprint + Y range the splat side uses
+  (`_test_inside_footprint` reused from `_spatial_crop_splat.py`). Per-object
+  removed face counts: bottle 48,014 / box 27,877 / lobster 17,140 (1.3-3.7 %
+  of the 1.296 M-face V32 scene mesh).
+- **Mesh patch**: `_build_mesh_patch()` triangulates the Track-1 desk-plane
+  grid (5 mm spacing, ~1 k vertices/object) and assigns per-vertex RGB from
+  the same `_best_view_per_point` + `_sample_color_for_points` + `_nn_fill_missing`
+  chain the splat patch uses. 1.8-2.3 k tris per patch.
+- **Output layout** at `output/phase_trim_inpaint_v32_data3/`:
+
+  ```
+  splat/
+    scene_full.ply                                # V32 scene splat untouched
+    per_object/<slug>/
+      object_only.ply                             # v6_cleaned bottle/box/lobster splat
+      desk_patch_only.ply                         # NN-copy patch Gaussians alone
+      scene_minus_object_patched.ply              # scene splat with object gone + patch
+  mesh/
+    scene_full.ply                                # V32 OpenMVS mesh untouched
+    per_object/<slug>/
+      object_only.ply / .obj / .mtl / .png / .glb # v9a_fp_v2 extracted, fully textured
+      desk_patch_only.ply                         # planar mesh patch w/ per-vertex RGB
+      scene_minus_object_patched.ply              # scene mesh with object faces gone + patch
+  ```
+
+- 36 files total. Texture sidecars (`scene_textured0.png` + per-object
+  `_mat.png` + OBJ/MTL/GLB) copied so each mesh per-object dir is
+  self-contained for MeshLab / Unity.
+- The mesh patch uses per-vertex colors (PLY format). If the user wants a
+  proper UV atlas instead (better Unity blending), upgrade to OBJ + xatlas
+  + baked atlas — left as TODO once the per-vertex test passes visual A/B.
+
+**Mesh-side colour fix (2026-06-18)**
+- User reported `mesh/scene_full.ply` showed an "scene_textured0.png not
+  loaded" warning in MeshLab and rendered uncolored. Root cause: the source
+  V32 PLY is VCG-textured (`comment TextureFile scene_textured0.png` +
+  per-face uchar/float texcoord) and references the atlas as a sidecar. The
+  raw `shutil.copy2` brought the PLY but not the PNG.
+- **Fix part 1**: `scene_textured0.png` copied next to `mesh/scene_full.ply`
+  (and into each `mesh/per_object/<slug>/` dir as a safety net). Full scene
+  now opens textured in MeshLab.
+- **Fix part 2** (orchestrator): `scene_mesh.visual.to_color()` bakes the
+  V32 atlas into per-vertex RGBA BEFORE the trim step. The resulting
+  `scene_minus_object_patched.ply` files are now self-contained per-vertex-
+  coloured PLYs (no sidecar required, ~775-794k verts each, mean RGB
+  [132, 122, 75] = desk brown). Renders correctly in any PLY viewer.
+- Trade-off acknowledged: per-vertex bake loses sub-vertex atlas detail
+  (e.g. fine wood grain between vertices). Acceptable for the visual A/B
+  test. For Unity production, will need to switch back to UV+atlas via a
+  VCG-textured writer + xatlas-baked extra-atlas for the patch faces.
+
+**`aggressive_prune_v2.py` — peripheral-artifact cleanup, coord-bug fix (2026-06-22)**
+- User reported a "leafy fringe" surrounding the V32 desk in scene_full
+  renders. Diagnosis: v1's `aggressive_prune.py --use-aabb` reads bounds
+  from `colmap/dense/tof_bounds.json` (COLMAP units, ~9× larger than
+  splat-space) but compares them DIRECTLY against the PLY's positions
+  (splat-space). Net: only z accidentally cropped, x/y are no-ops. The
+  20 % slack made it even more permissive. Verified by replaying the
+  filter on V32: kept 78 % of Gaussians as an arbitrary half-space cut,
+  not a desk box. Hence the fringe survives.
+- Fix: new script [`aggressive_prune_v2.py`](aggressive_prune_v2.py).
+  Same scale + opacity filters; the AABB step is rewritten entirely in
+  splat-space. Three sources of an AABB, in precedence:
+    1. Explicit `--aabb-x-min/.../z-max` six numbers
+    2. `--aabb-json` (any 6-key JSON in splat-space)
+    3. `--auto-aabb` (default ON): union of per-object splats in
+       `output/segmented_<scene>_v9a_fp_v2_splat_v6_cleaned/` +
+       a 30 cm metric margin (`--margin-m 0.30`)
+  Scale + opacity defaults UNCHANGED (95th percentile, 0.30) so the
+  desk and object interior detail are not touched.
+- V32 trial run:
+  - Input: `output/splat_v32_data3_noinit_pruned.ply` (226,665 G, 53.6 MB)
+  - Output: `output/splat_v32_data3_noinit_pruned_v2_desk.ply` (99,733 G, 23.6 MB)
+  - Auto-AABB (splat units, after 30 cm margin):
+    x[-1.16, +1.00] y[+0.23, +1.52] z[-0.86, +0.49]
+  - Filter breakdown: scale -11,334 (5 %); opacity -41,482;
+    AABB v2 -74,116 (the v1 AABB missed all of these on x/y due to the
+    coord-bug).
+- Doc: RUN_GUIDE.md "Cleaning floaters after training" section now
+  documents v1 (with bug noted) and v2 (recommended) side-by-side.
+- Pending: visual verification by user. Expect the leafy peripheral
+  fringe in the V32 scene render to be gone in `*_v2_desk.ply`, with
+  no visible loss on the desk / bottle / box / lobster.
+
+**`aggressive_prune_v3.py` — mesh-derived AABB, replaces v2 (2026-06-23)**
+- User visual A/B showed v2 was too aggressive: clipped the back wall
+  and the desk's perimeter because the AABB came from only the three
+  object splats (their union is roughly 80 × 35 × 45 cm of splat-space,
+  much smaller than the full reconstructed scene). 30 cm margin wasn't
+  enough to cover the back wall.
+- Fix: new script [`aggressive_prune_v3.py`](aggressive_prune_v3.py).
+  Derives the AABB from the V32 OpenMVS scene mesh's vertices, forward-
+  transformed to splat-space via the same `dataparser_transforms.json`
+  the splatfacto training used. Why this source is correct:
+  the scene mesh is the "ground truth" of what was actually triangulated;
+  the leafy fringe floaters do NOT exist in the mesh because they have
+  no real 3D geometry. So the mesh's spatial extent IS exactly the
+  envelope we want to keep, by construction.
+- Algorithm:
+    1. Read scene mesh vertices in metric.
+    2. Apply metric -> splat forward transform.
+    3. 1st-99th percentile AABB per axis (drops stray OpenMVS outliers).
+    4. Expand by 10 cm metric margin (`--margin-m 0.10`).
+    5. Same scale + opacity prune as v1/v2.
+- V32 trial run:
+  - Input: `output/splat_v32_data3_noinit_pruned.ply` (226,665 G, 53.6 MB)
+  - Output: `output/splat_v32_data3__trial_v3_mesh_aabb.ply` (153,752 G, 36.4 MB)
+  - Final AABB (splat units): x[-1.39, +1.13] y[+0.45, +1.68] z[-0.70, +0.81]
+  - Compared to v2 box (x[-1.16,+1.00] y[+0.23,+1.52] z[-0.86,+0.49]):
+    v3 box is bigger on x, y high, and z high (= more back-wall +
+    desk-perimeter coverage); slightly tighter on z low (= mesh ends
+    before the floater tail starts).
+  - Filter-3 drops: 20,097 (8.9 %) — exactly the floaters outside the
+    reconstructed envelope. v2 dropped 74,116; v1 dropped ~49 k
+    arbitrarily.
+- v2 output renamed to `output/splat_v32_data3__trial_v2_object_aabb.ply`
+  for side-by-side comparison.
+- RUN_GUIDE.md documents v1 / v2 / v3 side-by-side with the trade-offs
+  and when to use each.
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.
