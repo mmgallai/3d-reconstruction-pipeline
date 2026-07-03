@@ -8,14 +8,16 @@ Pipeline stages (in order):
        output/splat_<scene>_noinit_pruned.ply
        output/mesh_<scene>/mesh_<scene>_openmvs.ply
 
-  2. SPLAT CLEANUP -- mesh-AABB + N cm pure crop (no scale/opacity filter).
-     For V32:
-       dp_scale=0.173058, scale_factor_da3_to_colmap=8.798562,
-       metric_to_splat=1.522658, so 10 cm metric = 0.15227 splat units.
-     We forward-transform every V32 mesh vertex to splat space, take the
-     AABB, expand each face by margin_m * metric_to_splat, then drop
-     Gaussians whose centres fall outside. Writes
-       <out>/splat/scene_cleaned.ply
+  2. SPLAT CLEANUP -- v11: mesh-distance smoothstep, mode='both' (scale +
+     opacity fade). For each Gaussian, computes unsigned distance to the
+     nearest OpenMVS mesh face (Open3D RaycastingScene) and applies a
+     smoothstep multiplier that reaches 1.0 at `--cleanup-inner-m` and
+     0.0 at `--cleanup-outer-m`; the multiplier scales down the
+     Gaussian's three scale axes AND its opacity. Gaussians whose scale
+     or opacity fall below floor thresholds are then dropped. Defaults:
+     mode='both', inner=2 cm, outer=20 cm (PI-suggested soft-fade
+     approach, selected after v10/v11 sweeps -- see PROGRESS_LOG.md
+     "PI soft-fade" section). Writes <out>/splat/scene_cleaned.ply
 
   3. Per-object reuse (already done by scene_segmenter v9a_fp_v2).
      Copies the pre-built per-object meshes (PLY) and Clean-GS-pruned splats
@@ -38,11 +40,14 @@ CLI:
     python _pipeline_full.py [--scene-name v32_data3]
                              [--skip-reconstruction]
                              [--prompts white_water_bottle,blue_box,red_lobster_figurine]
-                             [--margin-m 0.10]
+                             [--cleanup-mode both]
+                             [--cleanup-inner-m 0.02]
+                             [--cleanup-outer-m 0.20]
                              [--out-root output/pipeline_v32_test_run]
 
 Default behaviour: V32, skip reconstruction, the 3 grabbable prompts,
-10 cm margin, writes to output/pipeline_v32_test_run/.
+v11 both-mode smoothstep 2->20 cm, writes to
+output/pipeline_v32_test_run/.
 """
 from __future__ import annotations
 
@@ -160,77 +165,68 @@ def stage_reconstruction(*, project_root: Path, scene_name: str,
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 -- splat cleanup (mesh-AABB + margin, pure crop)
+# Stage 2 -- splat cleanup (v11: mesh-distance smoothstep, scale + opacity)
 # ---------------------------------------------------------------------------
 
 def stage_splat_cleanup(*, splat_in: Path, mesh_in: Path,
                          dp_json: Path, bounds_json: Path,
-                         margin_m: float, out_ply: Path) -> dict:
-    _log(f"[stage 2] splat cleanup (mesh-AABB + {margin_m*100:.0f} cm margin)")
+                         inner_m: float, outer_m: float, mode: str,
+                         out_ply: Path, project_root: Path) -> dict:
+    _log(f"[stage 2] splat cleanup (v11 smoothstep, mode={mode}, "
+         f"inner={inner_m*100:.1f} cm, outer={outer_m*100:.1f} cm)")
     _log(f"  splat in : {splat_in}")
     _log(f"  mesh in  : {mesh_in}")
     _log(f"  dp json  : {dp_json}")
     _log(f"  bounds   : {bounds_json}")
+    _log(f"  out ply  : {out_ply}")
 
-    # --- Forward-transform: metric -> colmap -> splat ---
-    dp = json.loads(dp_json.read_text())
-    T = np.asarray(dp["transform"], dtype=np.float64)
-    R, t = T[:3, :3], T[:3, 3]
-    dp_scale = float(dp["scale"])
-    bounds = json.loads(bounds_json.read_text())
-    scale_factor = float(bounds["scale_factor_da3_to_colmap"])
-    metric_to_splat = dp_scale * scale_factor
-    _log(f"  dp_scale = {dp_scale:.6f}  "
-         f"scale_factor_da3_to_colmap = {scale_factor:.6f}  "
-         f"metric_to_splat = {metric_to_splat:.6f}")
+    script = project_root / "aggressive_prune_v11.py"
+    if not script.exists():
+        raise SystemExit(f"[fatal] aggressive_prune_v11.py not found: {script}")
 
-    import trimesh
-    m = trimesh.load(str(mesh_in), force="mesh", process=False)
-    v_metric = np.asarray(m.vertices, dtype=np.float64)
-    if len(v_metric) == 0:
-        raise SystemExit(f"[fatal] mesh has no vertices: {mesh_in}")
-    v_colmap = v_metric * scale_factor                                # NOT divide
-    v_splat = dp_scale * (v_colmap @ R.T + t[None, :])                # (N, 3)
+    out_ply.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, str(script),
+        str(splat_in),
+        "--scene-mesh", str(mesh_in),
+        "--dataparser", str(dp_json),
+        "--bounds-json", str(bounds_json),
+        "--mode", mode,
+        "--inner-m", str(inner_m),
+        "--outer-m", str(outer_m),
+        "--out", str(out_ply),
+    ]
+    _log(f"  cmd: {' '.join(cmd)}")
 
-    mins = v_splat.min(axis=0)
-    maxs = v_splat.max(axis=0)
-    spans = maxs - mins
-    _log(f"  strict AABB: x[{mins[0]:+.4f},{maxs[0]:+.4f}]  "
-         f"y[{mins[1]:+.4f},{maxs[1]:+.4f}]  "
-         f"z[{mins[2]:+.4f},{maxs[2]:+.4f}]  "
-         f"spans=({spans[0]:.3f}, {spans[1]:.3f}, {spans[2]:.3f})")
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    result = subprocess.run(cmd, env=env, check=False,
+                            capture_output=True, text=True)
+    for line in (result.stdout or "").splitlines():
+        _log(f"    | {line}")
+    if result.returncode != 0:
+        for line in (result.stderr or "").splitlines():
+            _log(f"    ! {line}")
+        raise SystemExit(
+            f"[fatal] aggressive_prune_v11.py exited with code {result.returncode}")
 
-    expand_splat = margin_m * metric_to_splat
-    exp_mins = mins - expand_splat
-    exp_maxs = maxs + expand_splat
-    _log(f"  expanded by {expand_splat:.4f} splat units per face "
-         f"(= {margin_m*100:.1f} cm metric)")
-
-    # --- Load splat once + apply pure AABB crop ---
-    data, dtype = _read_ply(splat_in)
-    n_in = len(data)
-    sx = data["x"].astype(np.float64)
-    sy = data["y"].astype(np.float64)
-    sz = data["z"].astype(np.float64)
-    keep = ((sx >= exp_mins[0]) & (sx <= exp_maxs[0]) &
-            (sy >= exp_mins[1]) & (sy <= exp_maxs[1]) &
-            (sz >= exp_mins[2]) & (sz <= exp_maxs[2]))
-    n_kept = int(keep.sum())
+    data_in, _ = _read_ply(splat_in)
+    n_in = len(data_in)
+    data_out, _ = _read_ply(out_ply)
+    n_kept = len(data_out)
     _log(f"  kept {n_kept:,}/{n_in:,} = {100.0*n_kept/max(n_in,1):.2f}%  "
-         f"(dropped {n_in - n_kept:,} outside-box gaussians)")
-
-    _write_ply(data[keep], out_ply)
+         f"(v11 {mode}-mode smoothstep, {inner_m*100:.1f}->{outer_m*100:.1f} cm)")
     _log(f"  wrote {out_ply}  ({_mb(out_ply):.1f} MB)")
 
     return {
-        "n_in": n_in, "n_kept": n_kept,
+        "method": "v11_smoothstep",
+        "mode": mode,
+        "inner_m": float(inner_m),
+        "outer_m": float(outer_m),
+        "n_in": int(n_in),
+        "n_kept": int(n_kept),
+        "pct_kept": round(100.0 * n_kept / max(n_in, 1), 2),
         "out_path": str(out_ply),
-        "expand_splat_units": float(expand_splat),
-        "metric_to_splat": float(metric_to_splat),
-        "dp_scale": dp_scale,
-        "scale_factor_da3_to_colmap": scale_factor,
-        "exp_mins": exp_mins.tolist(),
-        "exp_maxs": exp_maxs.tolist(),
     }
 
 
@@ -576,7 +572,7 @@ def stage_scene_full(*, splat_in: Path, mesh_in: Path,
 # ---------------------------------------------------------------------------
 
 def _write_readme(out_root: Path, scene_name: str, prompts: list,
-                  margin_m: float, stage2: dict, stage4: dict,
+                  stage2: dict, stage4: dict,
                   per_object: list):
     lines = [
         f"# Pipeline output: {scene_name}",
@@ -609,10 +605,15 @@ def _write_readme(out_root: Path, scene_name: str, prompts: list,
         "",
         "## Splat cleanup",
         "",
-        f"- margin: {margin_m*100:.1f} cm metric",
-        f"- metric_to_splat: {stage2['metric_to_splat']:.6f}",
-        f"- expansion per AABB face: {stage2['expand_splat_units']:.4f} splat units",
-        f"- gaussians kept: {stage2['n_kept']:,}/{stage2['n_in']:,}",
+        f"- method: {stage2['method']} (mesh-distance smoothstep)",
+        f"- mode: {stage2['mode']}  "
+        f"(both = scale-shrink AND opacity-fade)",
+        f"- inner edge: {stage2['inner_m']*100:.1f} cm  "
+        f"(distance where multiplier = 1.0)",
+        f"- outer edge: {stage2['outer_m']*100:.1f} cm  "
+        f"(distance where multiplier = 0.0)",
+        f"- gaussians kept: {stage2['n_kept']:,}/{stage2['n_in']:,}  "
+        f"({stage2['pct_kept']:.2f}%)",
         "",
         "## Scene without objects",
         "",
@@ -653,8 +654,19 @@ def main():
                     default="white_water_bottle,blue_box,red_lobster_figurine",
                     help="comma-separated object slugs (must match segmenter "
                          "output dir names)")
-    ap.add_argument("--margin-m", type=float, default=0.10,
-                    help="splat cleanup margin in metres (default 0.10 = 10 cm)")
+    ap.add_argument("--cleanup-mode",
+                    choices=("scale", "opacity", "both"), default="both",
+                    help="v11 splat-cleanup mode: 'scale' shrinks the "
+                         "Gaussian scale axes, 'opacity' fades the sigmoid "
+                         "opacity, 'both' does both (default)")
+    ap.add_argument("--cleanup-inner-m", type=float, default=0.02,
+                    help="v11 inner edge in metres: mesh-distance below "
+                         "this leaves Gaussians untouched (default 0.02 "
+                         "= 2 cm)")
+    ap.add_argument("--cleanup-outer-m", type=float, default=0.20,
+                    help="v11 outer edge in metres: mesh-distance beyond "
+                         "this fully suppresses Gaussians (default 0.20 "
+                         "= 20 cm)")
     ap.add_argument("--out-root", type=Path,
                     default=Path("output/pipeline_v32_test_run"))
     # Optional input overrides (sensible defaults wired for V32)
@@ -735,13 +747,19 @@ def main():
     _require(scene_splat, "scene splat (post-reconstruction)")
     _require(scene_mesh, "scene mesh (post-reconstruction)")
 
-    # ---- Stage 2: splat cleanup (mesh-AABB + N cm) ----
-    _section(f"stage 2 -- splat cleanup (+{args.margin_m*100:.0f} cm)")
+    # ---- Stage 2: splat cleanup (v11 smoothstep, mode=both by default) ----
+    _section(f"stage 2 -- splat cleanup "
+             f"({args.cleanup_mode}, {args.cleanup_inner_m*100:.1f}->"
+             f"{args.cleanup_outer_m*100:.1f} cm)")
     cleaned_splat = out_root / "splat" / "scene_cleaned.ply"
     stage2 = stage_splat_cleanup(
         splat_in=scene_splat, mesh_in=scene_mesh,
         dp_json=dp_json, bounds_json=bounds_json,
-        margin_m=args.margin_m, out_ply=cleaned_splat,
+        inner_m=args.cleanup_inner_m,
+        outer_m=args.cleanup_outer_m,
+        mode=args.cleanup_mode,
+        out_ply=cleaned_splat,
+        project_root=project_root,
     )
 
     # ---- Stage 3: per-object outputs ----
@@ -782,7 +800,7 @@ def main():
 
     # ---- README ----
     _section("writing README")
-    _write_readme(out_root, scene, prompts, args.margin_m,
+    _write_readme(out_root, scene, prompts,
                   stage2, stage4, per_object)
 
     # ---- Stage 6: summary ----
@@ -808,7 +826,9 @@ def main():
         "scene_name": scene,
         "out_root": str(out_root),
         "prompts": prompts,
-        "margin_m": args.margin_m,
+        "cleanup_mode": args.cleanup_mode,
+        "cleanup_inner_m": args.cleanup_inner_m,
+        "cleanup_outer_m": args.cleanup_outer_m,
         "stage2_splat_cleanup": stage2,
         "stage3_per_object": per_object,
         "stage4_scene_without_objects": stage4,

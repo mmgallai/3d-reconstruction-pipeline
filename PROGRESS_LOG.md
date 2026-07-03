@@ -486,6 +486,74 @@ Workflow output dump: `C:\Users\mgallai\AppData\Local\Temp\claude\<session>\task
 - RUN_GUIDE.md documents v1 / v2 / v3 side-by-side with the trade-offs
   and when to use each.
 
+### 2026-07-03 — PI soft-fade (v10 opacity, v11 SDF) integrated as canonical splat cleanup
+
+**Trigger.** PI proposed two ideas for the leafy-fringe / hard-edge cut problem
+we hit with v1-v9 (all hard binary keep/drop masks):
+1. **Opacity modulation** — instead of dropping outside-AABB Gaussians, apply a
+   smoothstep opacity falloff so ellipsoids fade to zero rather than pop.
+2. **SDF-based suppression** — compute (signed) distance to the mesh and
+   dynamically shrink each Gaussian's scale or opacity as the distance grows.
+
+Neither idea had been tried in v1-v9; all previous variants were binary
+threshold cuts.
+
+**v10 (opacity fade at mesh-AABB) — new script.**
+[`aggressive_prune_v10.py`](aggressive_prune_v10.py). Same mesh-AABB
+(splat-space, expanded by margin) as v3, but instead of hard-cropping,
+computes `dist_outside` per Gaussian center and multiplies the sigmoid
+opacity by `smoothstep(inner_edge, outer_edge, dist)`. No Gaussians are
+dropped by position; only `--drop-if-below` removes ones whose new
+sigmoid falls under a floor.
+
+  | Trial | Falloff | % kept | n_full | n_partial | n_zeroed | Path |
+  |---|---|---:|---:|---:|---:|---|
+  | v10_margin10cm_f5cm  | 5 cm  | 91.90 % | 202,648 | 6,188  | 18,317 | `output/splat_v32_data3__v10_margin10cm_f5cm.ply` |
+  | v10_margin10cm_f10cm | 10 cm | 93.85 % | 203,262 | 10,126 | 13,765 | `output/splat_v32_data3__v10_margin10cm_f10cm.ply` |
+  | v10_margin10cm_f20cm | 20 cm | 96.73 % | 204,354 | 15,561 | 7,238  | `output/splat_v32_data3__v10_margin10cm_f20cm.ply` |
+
+Falloff-width analysis: 5 cm behaves almost identically to v3's hard crop
+(partial band captures only 2.7 % of Gaussians vs 8.1 % zeroed). Median
+`dist_outside` = 10.6 cm, p90 = 32 cm, max 78 cm. Only 20 cm falloff
+places the transition zone over the meaningful p50 → p90 range.
+
+**v11 (mesh-distance smoothstep, scale/opacity/both) — new script.**
+[`aggressive_prune_v11.py`](aggressive_prune_v11.py). Uses Open3D
+`RaycastingScene.compute_distance` for unsigned distance to the nearest
+mesh face (true SDF isn't defined for our open OpenMVS mesh; unsigned
+distance is the well-defined approximation). Smoothstep multiplier
+between `--inner-m` and `--outer-m`, applied to either scale
+(`log(scale) += log(mult)` across scale_0/1/2), opacity (same math as
+v10), or both. Distance distribution on V32: median 2.45 cm, p90
+26 cm — most Gaussians sit close to the mesh, so a per-mesh-face fade is
+much finer-grained than v10's AABB.
+
+  | Trial | Mode | Inner→Outer | % kept | n_full | n_partial | n_zeroed | Path |
+  |---|---|---|---:|---:|---:|---:|---|
+  | v11_scale_i2cm_o20cm    | scale   | 2 → 20 cm | 85.43 % | 125,811 | 72,302 | 29,040 | `output/splat_v32_data3__v11_scale_i2cm_o20cm.ply` |
+  | v11_scale_i5cm_o30cm    | scale   | 5 → 30 cm | 89.21 % | 161,151 | 46,193 | 19,809 | `output/splat_v32_data3__v11_scale_i5cm_o30cm.ply` |
+  | v11_opacity_i2cm_o20cm  | opacity | 2 → 20 cm | 86.99 % | 125,811 | 72,302 | 29,040 | `output/splat_v32_data3__v11_opacity_i2cm_o20cm.ply` |
+  | **v11_both_i2cm_o20cm** | both    | 2 → 20 cm | 85.41 % | 125,811 | 72,302 | 29,040 | `output/splat_v32_data3__v11_both_i2cm_o20cm.ply` **← chosen** |
+  | v11_both_i5cm_o30cm     | both    | 5 → 30 cm | 89.20 % | 161,151 | 46,193 | 19,809 | `output/splat_v32_data3__v11_both_i5cm_o30cm.ply` |
+
+**Verdict (user visual inspection).** `v11_both_i2cm_o20cm` wins:
+mesh-distance driver is finer-grained than v10's AABB shell, and doing
+both scale-shrink AND opacity-fade attenuates far-from-mesh floaters
+harder than either alone.
+
+**Integration.** [`_pipeline_full.py`](_pipeline_full.py) stage 2 now
+subprocess-calls `aggressive_prune_v11.py` with `--mode both --inner-m
+0.02 --outer-m 0.20`. Old `--margin-m` CLI arg dropped, replaced with
+`--cleanup-mode` / `--cleanup-inner-m` / `--cleanup-outer-m`.
+`_write_readme` + summary.json now record the new params.
+
+**Smoke test** at `output/pipeline_v32_v11_smoketest/`: full pipeline
+runs end-to-end, 227,153 → 194,016 Gaussians (85.41 %) matching the
+standalone v11 trial exactly. Scene-without-objects downstream stage
+unaffected (drops 12,732 Gaussians via object footprints as before).
+
+---
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.

@@ -399,6 +399,92 @@ filters alone. The real fixes for reflection blobs are:
   - SAM-based screen masking + retrain (heavier infra work)
   - SpotLessSplats robust masking (training-time, on the roadmap)
 
+### v4 – v9 (exploratory 2026-06-27) — all binary keep/drop, all rejected
+
+Nine post-training filters were built and swept: v4 density outliers,
+v5 mesh-distance hard threshold, v6 shape-aware (effective extent +
+anisotropy), v7 surface-normal projected covariance, v8 view utilization
+(render-space), v9 v7 ∩ v8. Every one damaged desk / back-wall pixels
+somewhere. The "least bad" was v7 at `--perp-mm 5` (76.7 % kept,
+essentially no filter). Full write-up + result-file paths in
+`splat_cleanup_methods_schedule.xlsx` (Downloads) and the "PI soft-fade"
+section of [PROGRESS_LOG.md](PROGRESS_LOG.md).
+
+Take-away: **any hard binary cut breaks something** because trained
+Gaussians work as a team — removing borderline members degrades the
+whole render, even when the rule that fires on them is mathematically
+correct.
+
+### `aggressive_prune_v10.py` (opacity fade, mesh-AABB) — 2026-07-03
+
+PI-suggested departure from binary cuts: **soft opacity falloff**. No
+Gaussians are dropped by position. For each center, compute distance
+outside a mesh-AABB expanded by `--margin-m` (default 10 cm). Between
+that inner boundary and the outer boundary (inner + `--falloff-m`),
+multiply the sigmoid opacity by a smoothstep curve that eases from 1.0
+down to 0.0. Beyond the outer boundary, opacity → 0 (removed by
+`--drop-if-below`).
+
+```powershell
+python aggressive_prune_v10.py output/splat_v32_data3_noinit_pruned.ply `
+  --margin-m 0.10 --falloff-m 0.20 `
+  --out output/splat_v32_data3__v10_margin10cm_f20cm.ply
+```
+
+V32 sweep results:
+
+| Falloff | % kept | n_full opac | n_partial (fade) | n_zeroed |
+|---|---:|---:|---:|---:|
+| 5 cm  | 91.90 % | 202,648 | 6,188  | 18,317 |
+| 10 cm | 93.85 % | 203,262 | 10,126 | 13,765 |
+| 20 cm | 96.73 % | 204,354 | 15,561 | 7,238  |
+
+Best of the three: `--falloff-m 0.20`. Superseded by v11 below.
+
+### `aggressive_prune_v11.py` (RECOMMENDED, 2026-07-03) — mesh-distance smoothstep
+
+PI's second idea, adapted for open meshes: compute unsigned distance to
+the nearest mesh face (Open3D `RaycastingScene.compute_distance`; true
+signed SDF isn't defined for our open OpenMVS surface). Between
+`--inner-m` (default 2 cm) and `--outer-m` (default 20 cm), a smoothstep
+multiplier attenuates the Gaussian. `--mode` picks what gets
+attenuated:
+
+- `scale`: multiplies the three Gaussian scale axes (`log(scale) += log(mult)`)
+- `opacity`: multiplies the sigmoid opacity (same math as v10)
+- `both` (default, PRODUCTION): applies both
+
+```powershell
+python aggressive_prune_v11.py output/splat_v32_data3_noinit_pruned.ply `
+  --mode both --inner-m 0.02 --outer-m 0.20 `
+  --out output/splat_v32_data3__v11_both_i2cm_o20cm.ply
+```
+
+V32 result (`--mode both --inner-m 0.02 --outer-m 0.20`):
+227,153 → **194,016 Gaussians (85.41 % kept)**. Distance distribution:
+median 2.45 cm, p90 26 cm — most Gaussians sit close to the mesh, so
+per-triangle distance is much finer-grained than v10's coarse AABB
+shell.
+
+Chosen by visual A/B (2026-07-03) over v10 and v11 alternatives —
+`both` mode's combination of shape-shrink + opacity-fade attenuates
+far-from-mesh floaters more aggressively than either lever alone while
+leaving desk / back-wall / objects untouched.
+
+**Full sweep of v11 modes and thresholds:**
+
+| Mode | Inner→Outer | % kept | File |
+|---|---|---:|---|
+| scale   | 2 → 20 cm | 85.43 % | `splat_v32_data3__v11_scale_i2cm_o20cm.ply` |
+| scale   | 5 → 30 cm | 89.21 % | `splat_v32_data3__v11_scale_i5cm_o30cm.ply` |
+| opacity | 2 → 20 cm | 86.99 % | `splat_v32_data3__v11_opacity_i2cm_o20cm.ply` |
+| **both** | **2 → 20 cm** | **85.41 %** | **`splat_v32_data3__v11_both_i2cm_o20cm.ply`** ← production |
+| both    | 5 → 30 cm | 89.20 % | `splat_v32_data3__v11_both_i5cm_o30cm.ply` |
+
+**Integration:** `_pipeline_full.py` stage 2 now subprocess-invokes v11
+with these defaults. New CLI flags: `--cleanup-mode`, `--cleanup-inner-m`,
+`--cleanup-outer-m`. The old `--margin-m` arg is gone.
+
 ---
 
 ## Per-object extraction (Unity / Quest 3 deliverables)
