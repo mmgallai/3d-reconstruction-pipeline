@@ -770,6 +770,67 @@ Mesh side (verified by earlier workflow `wttb6kq0n`, reviewer A):
 
 ---
 
+### 2026-07-06 (final) — Scene-without-objects: final state summary
+
+After a long iteration cycle (v2 → v8), the "scene without objects" step
+converged on a fully deterministic, open-source, clone-based pipeline
+that produces perfectly matching mesh + splat patches.
+
+**Final commit chain on v32 branch:**
+- `66f060e` — 3D distance-to-mesh crop (replaces XZ silhouette)
+- `71a6571` — Initial Q2 clone-fill (mesh via PyMeshFix, splat via K-NN)
+- `e289899` — Revert scene-wide MeshFix; targeted planar patches only
+- `4dcb3ba` — Patch footprint = predicate OR (obj_AABB + crop_dist)
+- `a393208` — AABB pad = crop_dist + 2 cm (close residual tiny gaps)
+- `3afc76d` — Splat scale floor 3.5 mm (prevent dot-pattern gaps)
+
+**End-to-end flow (from _run_full_scratch_chain.sh):**
+
+1. `scene_segmenter.pipeline` — SAM3 finds objects in the 140 views.
+2. `_spatial_crop.py` / `_spatial_crop_splat.py` / `_clean_splat.py` —
+   produce per-object mesh + splat deliverables.
+3. `_unseen_core_map.py --auto-desk` — RANSAC-fit the tilted desk plane
+   per object; write NPZ with grid_points at 5 mm spacing on the plane.
+4. `_seed_desk_patch.py` — clone-mode K=200 K-NN over ~66k donor
+   Gaussians (in 5-30 cm shell around objects, below Y ceiling).
+   Enforces 3.5 mm per-axis sigma floor so patches don't leave visible
+   dot gaps against the 5 mm grid.
+5. `_pipeline_full.py` stage 4 — mesh side does 3D-distance-to-mesh
+   crop (5 cm threshold, any-vertex-in face drop) + per-object planar
+   patch triangulated over the NPZ grid + K-NN clone RGB (K=200 median
+   from same donor pool as splat). Patch footprint uses union of
+   predicate-driven mask + AABB inflated by crop_dist + 2 cm safety
+   pad -> guarantees no exposed ring.
+
+**Numerical guarantees on V32 output/pipeline_v32_v11_patches_v8/:**
+
+- Mesh crop hole coverage: patch dimensions match crop within 0.2 cm.
+- Mesh patch color vs surrounding ring: within ±1-8 RGB per channel.
+- Splat patch color vs ring: within ±1-8 RGB per channel.
+- Splat 2-sigma coverage per patch: 7.0-7.3 mm (overlaps 5 mm grid).
+- Mesh size vs v4: +6-8k faces (only patch geometry, no scene-wide bloat).
+- Zero residual object-palette vertices/Gaussians within object volumes.
+
+**Why this works (no diffusion, no hallucination):**
+
+Everything is COPY, not PREDICT. Colors, opacities, scales, rotations
+all come from the median of 200 real desk Gaussians/vertices around the
+hole. The desk's own material is the source of truth; we just clone it
+into the removed area. The three defensive fixes (AABB floor for
+coverage, +2 cm pad for boundary robustness, 3.5 mm sigma floor for
+visual density) address geometric edge cases without ever changing the
+"clone from real desk" semantics.
+
+**Known non-blocking follow-ups (see workflow reviews):**
+- SAM3 mask resolution not asserted against source photo resolution.
+- Dead code: `_clone_fill_mesh_hole` PyMeshFix path kept in file but
+  no longer called; view-sampling mode still callable via
+  `--mode views` but unused by default.
+- The +2 cm patch safety pad extends into the desk margin; if two
+  objects were < 15 cm apart the patches would meet edge-to-edge.
+
+---
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.
