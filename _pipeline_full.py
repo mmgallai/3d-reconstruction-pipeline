@@ -24,13 +24,17 @@ Pipeline stages (in order):
      into <out>/{mesh,splat}/objects/<slug>.ply.
 
   4. Scene-without-objects (mesh side + splat side, combined for all prompts).
-     - MESH: load V32 mesh, bake per-vertex atlas colours, drop faces whose
-             centroid lies inside ANY of the prompt footprints (XZ + Y), then
-             add one planar mesh patch per prompt (from the precomputed
-             unseen_core NPZs + RGB resampling). Concatenate -> scene mesh.
-     - SPLAT: start from stage-2 output, drop Gaussians inside ANY prompt
-              footprint, concatenate the 3 desk patches from
-              output/desk_patch_<scene>/desk_patch_<slug>.ply.
+     - Object volume = 3D distance to the extracted object mesh <= 5 cm,
+       capped at Y_min + 1 m. Follows the object's real shape (bottle
+       neck, overhangs) instead of a coarse XZ silhouette + Y range.
+     - MESH: load V32 mesh, bake per-vertex atlas colours, drop any face
+             with ANY vertex inside ANY object volume (any-vertex test,
+             not centroid), then add one planar mesh patch per prompt
+             from the unseen_core NPZs + SAM3-masked top-K median RGB
+             resampling. Concatenate -> scene mesh.
+     - SPLAT: start from stage-2 output, drop Gaussians whose CENTER is
+              inside any object volume, concatenate the 3 desk patches
+              from output/desk_patch_<scene>/desk_patch_<slug>.ply.
 
   5. Assembly + scene_full copies.
 
@@ -70,8 +74,6 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 from _spatial_crop_splat import (                  # noqa: E402
     _load_dataparser_transform,
     _splat_to_metric,
-    _build_footprint_from_extracted_mesh,
-    _test_inside_footprint,
 )
 
 if sys.platform == "win32":
@@ -334,16 +336,71 @@ def _bake_vertex_colors_from_atlas(mesh):
         _log(f"  WARN: atlas->vertex bake failed ({e})")
 
 
-def _drop_faces_inside_any(scene_mesh, footprints: list):
-    """Drop faces whose centroid is inside ANY of the supplied footprints.
+def _build_object_distance_predicate(extracted_ply: Path,
+                                       dist_threshold_m: float,
+                                       y_ceiling_offset_m: float = 1.0) -> dict:
+    """Build a 3D distance predicate: 'is a point within dist_threshold_m
+    of the extracted object mesh?'.
 
-    Returns (new_trimesh, n_removed). Preserves per-vertex colours.
+    Returns a dict {scene, dist_threshold_m, y_ceiling_m} used by
+    _test_within_object_distance. The Y ceiling caps the distance query
+    at Y_min + y_ceiling_offset_m so distant ceiling / wall faces above
+    the desk cannot pollute the crop volume.
+    """
+    import open3d as o3d
+    import trimesh as _tm
+    m = _tm.load(str(extracted_ply), force="mesh", process=False)
+    verts = np.asarray(m.vertices, dtype=np.float32)
+    faces = np.asarray(m.faces, dtype=np.uint32)
+    tm = o3d.t.geometry.TriangleMesh()
+    tm.vertex.positions = o3d.core.Tensor(verts)
+    tm.triangle.indices = o3d.core.Tensor(faces)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(tm)
+    y_min = float(verts[:, 1].min())
+    return {
+        "scene": scene,
+        "dist_threshold_m": float(dist_threshold_m),
+        "y_min": y_min,
+        "y_ceiling_m": y_min + float(y_ceiling_offset_m),
+        "extracted_ply": str(extracted_ply),
+    }
+
+
+def _test_within_object_distance(positions_metric: np.ndarray,
+                                   pred: dict) -> np.ndarray:
+    """True if positions_metric[i] is within pred['dist_threshold_m'] of the
+    predicate's extracted mesh AND below the y_ceiling.
+    """
+    import open3d as o3d
+    pts32 = positions_metric.astype(np.float32)
+    dists = pred["scene"].compute_distance(o3d.core.Tensor(pts32)).numpy()
+    inside = dists <= pred["dist_threshold_m"]
+    inside &= positions_metric[:, 1] <= pred["y_ceiling_m"]
+    return inside
+
+
+def _drop_faces_inside_any(scene_mesh, predicates: list):
+    """Drop faces where ANY vertex is within the distance threshold of ANY
+    object predicate (or, equivalently, keep only faces whose ALL three
+    vertices are more than the threshold away from every object).
+
+    Any-vertex test (vs centroid-only) fixes the "dangling stub" bug: a
+    face straddling the object boundary with 1-2 verts inside but centroid
+    just outside was surviving before, leaving jagged geometry above the
+    removed object.
+
+    Returns (new_trimesh, n_removed_faces). Preserves per-vertex colours.
     """
     import trimesh
-    centroids = _mesh_face_centroids(scene_mesh)
-    inside_any = np.zeros(len(centroids), dtype=bool)
-    for fp in footprints:
-        inside_any |= _test_inside_footprint(centroids, fp)
+    verts = np.asarray(scene_mesh.vertices, dtype=np.float64)
+    faces = np.asarray(scene_mesh.faces, dtype=np.int64)
+    vert_inside = np.zeros(len(verts), dtype=bool)
+    for pred in predicates:
+        vert_inside |= _test_within_object_distance(verts, pred)
+    # A face is dropped if any of its 3 vertices is inside an object volume.
+    face_touches = vert_inside[faces].any(axis=1)
+    inside_any = face_touches
     keep = ~inside_any
     faces = np.asarray(scene_mesh.faces, dtype=np.int64)
     kept_faces = faces[keep]
@@ -459,27 +516,35 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
     _log("[stage 4] scene without objects (mesh + splat, combined)")
 
     # ----- Build the spatial-crop predicate per prompt -----
-    # Extend Y_max upward on BOTH mesh and splat sides so the crop catches
-    # the FULL column above each object. SAM3-derived extracted meshes
-    # often undershoot on translucent tops (V32 water bottle: extracted
-    # Y_max=0.234 m vs true bottle top ~0.32 m in the scene mesh), and the
-    # matching splat Gaussians survive tight y_max too (3,491 bottle-top
-    # ghosts observed empirically above Y=0.239 up to Y=0.462 m). The XZ
-    # footprint is TIGHT (object silhouette + 0.5 cm dilation), so risk of
-    # clipping legitimate scene structure directly above an object on a
-    # desk is small; v11 has already suppressed most floaters.
-    footprints = []
+    # 3D distance-to-extracted-mesh crop: replaces the earlier XZ silhouette
+    # approach. For each object, drop mesh vertices / splat Gaussians
+    # within a metric distance threshold (default 5 cm) of the extracted
+    # object mesh, up to a Y ceiling (Y_min + 1 m) to prevent the query
+    # picking up distant ceiling/wall geometry above the desk.
+    #
+    # This subsumes the "XZ dilation + Y range" approach and handles:
+    #   - Objects with complex shapes (bottle neck vs base) where the XZ
+    #     silhouette can't follow the 3D volume.
+    #   - Stretched anisotropic Gaussians whose CENTER sits 3-5 cm outside
+    #     the tight silhouette but whose ellipsoid extends into the
+    #     object (visible as the "blue vertical stripe" artifact above
+    #     the blue box in the v2 output — 682 anisotropy>5x Gaussians in
+    #     the 3-5 cm ring alone).
+    #   - Overhangs above the extracted mesh (translucent bottle tops
+    #     missed by SAM3).
+    #
+    # V32 objects are 10-30 cm apart so a 5 cm radius does not intrude
+    # on neighbours; if objects are tighter this can be lowered via
+    # --crop-distance-m (default 0.05).
+    predicates = []
     for slug in prompts:
         ply = _require(object_mesh_dir / slug / f"{slug}_extracted.ply",
                        f"extracted obj mesh for {slug}")
-        fp = _build_footprint_from_extracted_mesh(
-            ply, xz_resolution=0.005, xz_dilate_cm=0.5, y_margin_cm=0.5)
-        fp["y_max"] = fp["y_min"] + 1.0  # 1 m upward extension
-        area_cm2 = float(fp["fp_mask"].sum()) * (fp["resolution"] * 100.0) ** 2
-        _log(f"  [{slug}] footprint area = {area_cm2:.0f} cm^2, "
-             f"Y in [{fp['y_min']:+.3f}, {fp['y_max']:+.3f}] m "
-             f"(y_max extended +1 m for column crop)")
-        footprints.append(fp)
+        pred = _build_object_distance_predicate(
+            ply, dist_threshold_m=0.05, y_ceiling_offset_m=1.0)
+        _log(f"  [{slug}] object predicate: 3D dist <= 5.0 cm, "
+             f"y_ceiling = {pred['y_ceiling_m']:.3f} m")
+        predicates.append(pred)
 
     # ===== SPLAT side =====
     _log("  --- splat side ---")
@@ -493,9 +558,9 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
         axis=-1).astype(np.float64)
     pos_metric = _splat_to_metric(pos_splat, R, t, dp_scale, colmap_to_metric)
     inside_any_splat = np.zeros(n_cleaned, dtype=bool)
-    for fp, slug in zip(footprints, prompts):
-        ins = _test_inside_footprint(pos_metric, fp)
-        _log(f"    [{slug}] splat inside footprint: {int(ins.sum()):,}")
+    for pred, slug in zip(predicates, prompts):
+        ins = _test_within_object_distance(pos_metric, pred)
+        _log(f"    [{slug}] splat within 5 cm of object mesh: {int(ins.sum()):,}")
         inside_any_splat |= ins
     keep_splat = ~inside_any_splat
     _log(f"    cleaned splat: {n_cleaned:,} -> {int(keep_splat.sum()):,} "
@@ -536,7 +601,7 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
     _bake_vertex_colors_from_atlas(scene_mesh)
 
     trimmed_mesh, n_removed_faces = _drop_faces_inside_any(scene_mesh,
-                                                            footprints)
+                                                            predicates)
     _log(f"    trimmed mesh: removed {n_removed_faces:,} faces, "
          f"{len(trimmed_mesh.faces):,} remain")
 

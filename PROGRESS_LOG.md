@@ -630,6 +630,65 @@ noted for later:
 
 ---
 
+### 2026-07-06 (later) — Stage 4 crop rewritten: 3D distance-to-object-mesh (was XZ silhouette)
+
+**Trigger.** After the 2026-07-06 patch-color / blue-plane / bottle-stub
+fixes, user visually flagged that stubs, red blobs, and a "blue vertical
+stripe" were still visible in the v2 output. Root-cause analysis showed
+the XZ silhouette + Y range crop (with a 0.5 cm and later 3 cm dilation)
+was missing ~800 anisotropic Gaussians per object sitting 3-5 cm outside
+the tight silhouette but whose ellipsoids extended into the object.
+
+**Fix.** Replaced the XZ silhouette crop with a **3D distance-to-mesh
+predicate**. For each object:
+
+  pred = _build_object_distance_predicate(
+      extracted_ply, dist_threshold_m=0.05, y_ceiling_offset_m=1.0)
+
+Uses Open3D `RaycastingScene.compute_distance` (unsigned distance to
+nearest triangle) with a Y-ceiling cap (Y_min + 1.0 m) to prevent the
+query from picking up distant ceiling/wall faces above the desk.
+
+Both mesh and splat sides use the same predicate:
+  - **Splat**: drop Gaussians whose CENTER is within 5 cm of any object.
+  - **Mesh**: drop any face where ANY vertex is within 5 cm of any object
+    (was: centroid-only; the any-vertex test fixes dangling boundary faces).
+
+**Numerical verification (output/pipeline_v32_v11_patches_v4/):**
+
+| Metric | v2 (silhouette) | v3 (3 cm dilation) | v4 (3D distance) |
+|---|---:|---:|---:|
+| Splat gaussians removed | 12,732 | 16,492 | 17,070 |
+| Mesh faces removed | 93,484 | 117,156 | 156,283 |
+| Non-patch splat within 5 cm | 3,205 | 1,352 | **0** ✓ |
+| Non-patch mesh verts within 5 cm | 33,854 | 13,918 | **0** ✓ |
+| Anisotropic (>5x) within 5 cm | 2,479 | 1,033 | ~0 |
+| Patch mean RGB (bottle) | (155,143,98) | — | (155,143,98) |
+| Patch mean RGB (blue box) | (142,133,88) | — | (142,133,88) |
+| Patch mean RGB (lobster) | (159,138,92) | — | (159,138,92) |
+
+**Regression sniff (SHA-verified):** `scene_full.ply`, `scene_cleaned.ply`,
+and all 6 per-object PLYs are byte-identical between v2 and v4 (stages
+1-3 and 5 unchanged; only stage 4 differs).
+
+**Adversarial review (4-agent workflow `wizpox1tf`).** Three of four
+reviewers ok. R1 initially flagged 1,074 non-patch survivors within 5 cm
+but their patch-identification undercounted the actual 3,319 desk patches
+by ~1,000 — the survivors R1 counted were misclassified patch Gaussians.
+Verified via NPZ-grid-proximity patch matching that the true non-patch
+count within 5 cm is 0 across mesh and splat.
+
+**Follow-ups (non-blocking):**
+- Removed dead imports of `_build_footprint_from_extracted_mesh` and
+  `_test_inside_footprint` (no longer used after the 3D-distance rewrite).
+- SAM3 mask resolution assertion + `_nn_fill_missing` all-NaN guard from
+  the previous review still open.
+- View-dependent monitor reflection artifacts ("blue stripe") persist
+  even after v4 — this is a train-time issue (SpotLessSplats / SAM3
+  masking + retrain) rather than a post-process fix.
+
+---
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.
