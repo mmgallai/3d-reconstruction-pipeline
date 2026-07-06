@@ -107,7 +107,7 @@ def fit_local_desk_plane(scene_mesh_verts: np.ndarray,
                           ransac_distance_threshold: float = 0.005,
                           ransac_iterations: int = 3000,
                           min_inliers_required: int = 100,
-                          max_normal_tilt_deg: float = 35.0,
+                          max_normal_tilt_deg: float = 45.0,
                           ) -> tuple[np.ndarray | None, float | None, dict]:
     """RANSAC-fit a 3D plane to the desk neighbourhood around an object.
 
@@ -277,6 +277,7 @@ def analyze_object(view_source, scene, scene_mesh_verts: np.ndarray | None,
                    halo_outer_m: float = 0.15,
                    halo_inner_m: float = 0.01,
                    ransac_distance_threshold: float = 0.005,
+                   max_normal_tilt_deg: float = 45.0,
                    ) -> dict:
     print(f"\n=== {obj_name} ===")
     if not extracted_ply.exists():
@@ -292,6 +293,7 @@ def analyze_object(view_source, scene, scene_mesh_verts: np.ndarray | None,
             scene_mesh_verts, x_min, x_max, z_min, z_max,
             halo_outer_m=halo_outer_m, halo_inner_m=halo_inner_m,
             ransac_distance_threshold=ransac_distance_threshold,
+            max_normal_tilt_deg=max_normal_tilt_deg,
         )
         if plane_normal is None:
             print(f"  AUTO-DESK FALLBACK: {plane_info.get('rejected', 'unknown')}; "
@@ -415,9 +417,26 @@ def main():
     p.add_argument("--auto-desk-halo-outer-m", type=float, default=0.15)
     p.add_argument("--auto-desk-halo-inner-m", type=float, default=0.01)
     p.add_argument("--auto-desk-ransac-thresh-m", type=float, default=0.005)
+    p.add_argument("--auto-desk-max-tilt-deg", type=float, default=45.0,
+                   help="Reject RANSAC plane fits whose normal tilts more "
+                        "than this from world +Y (guard against locking "
+                        "onto a wall). Default 45° accommodates the ~35° "
+                        "desk tilt in V32 with headroom.")
+    p.add_argument("--auto-desk-seed", type=int, default=0,
+                   help="RNG seed for Open3D RANSAC plane fits (via "
+                        "o3d.utility.random.seed). Makes --auto-desk "
+                        "deterministic across runs; change if a specific "
+                        "seed causes an outlier fit.")
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed Open3D's RNG so RANSAC plane fits are deterministic across runs.
+    # Without this, segment_plane's non-seedable internal RNG can flip the
+    # tilt-guard decision between runs on identical data (e.g. blue_box
+    # fit at 34.9° one run vs 46° the next).
+    import open3d as _o3d
+    _o3d.utility.random.seed(int(args.auto_desk_seed))
 
     print("[init] loading V32 view source")
     vs = V32ViewSource(args.project_root)
@@ -443,7 +462,8 @@ def main():
                            auto_desk=args.auto_desk,
                            halo_outer_m=args.auto_desk_halo_outer_m,
                            halo_inner_m=args.auto_desk_halo_inner_m,
-                           ransac_distance_threshold=args.auto_desk_ransac_thresh_m)
+                           ransac_distance_threshold=args.auto_desk_ransac_thresh_m,
+                           max_normal_tilt_deg=args.auto_desk_max_tilt_deg)
         results.append(r)
 
     # Summary

@@ -395,20 +395,48 @@ def _build_mesh_patch(grid_points_metric: np.ndarray, grid_shape: tuple,
 
 
 def _resample_patch_rgb(npz_path: Path, scene_mesh_path: Path,
-                         view_source) -> tuple:
+                         view_source, sam3_cache: Path | None = None,
+                         prompt_slug: str | None = None) -> tuple:
     """Re-derive (grid_points_metric, rgb01, grid_shape) so the mesh patch
-    uses the same colour sampling pipeline as the splat patch."""
-    from _seed_desk_patch import (_best_view_per_point,
-                                   _sample_color_for_points,
+    uses the same colour sampling pipeline as the splat patch.
+
+    Uses top-K views + per-channel median RGB (robust to SAM3 mask
+    anti-aliasing edge bleed) and, when a SAM3 cache is provided, drops
+    views whose mask marks the object at the target pixel (so object
+    colour cannot bake into the patch)."""
+    from _seed_desk_patch import (_topk_views_per_point,
+                                   _sample_color_topk,
+                                   _load_sam3_masks,
                                    _nn_fill_missing)
     data = np.load(npz_path)
     pts_m = data["grid_points"].astype(np.float32)
     seen = data["seen_count"]
+
+    # Use the auto-desk normal when the NPZ has it; boosts scoring for
+    # top-K view selection.
+    desk_normal_metric = None
+    if "desk_normal_metric" in data.files:
+        desk_normal_metric = np.asarray(
+            data["desk_normal_metric"], dtype=np.float64)
+
+    sam3_masks = None
+    if sam3_cache is not None and prompt_slug is not None:
+        view_names = [v.name for v in view_source.all_views()]
+        sam3_masks = _load_sam3_masks(sam3_cache, prompt_slug,
+                                       view_names, dilate_px=8)
+
     _log(f"    resampling RGB for {len(pts_m)} grid points "
-         f"({int((seen==0).sum())} truly-unseen)")
-    best_view, best_uv = _best_view_per_point(view_source, scene_mesh_path,
-                                              pts_m, seen)
-    rgb = _sample_color_for_points(view_source, best_view, best_uv)
+         f"({int((seen==0).sum())} truly-unseen); "
+         f"sam3_guard={'on' if sam3_masks else 'off'}, "
+         f"desk_normal={'set' if desk_normal_metric is not None else 'default'}")
+
+    topk_view, topk_uv = _topk_views_per_point(
+        view_source, scene_mesh_path, pts_m, seen,
+        sam3_masks=sam3_masks,
+        desk_normal_metric=desk_normal_metric,
+        k=5,
+    )
+    rgb = _sample_color_topk(view_source, topk_view, topk_uv)
     rgb = _nn_fill_missing(pts_m.astype(np.float64), rgb)
     shape_xz = tuple(int(x) for x in data["shape_xz"])
     return pts_m.astype(np.float64), rgb.astype(np.float32), shape_xz
@@ -431,15 +459,26 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
     _log("[stage 4] scene without objects (mesh + splat, combined)")
 
     # ----- Build the spatial-crop predicate per prompt -----
+    # Extend Y_max upward on BOTH mesh and splat sides so the crop catches
+    # the FULL column above each object. SAM3-derived extracted meshes
+    # often undershoot on translucent tops (V32 water bottle: extracted
+    # Y_max=0.234 m vs true bottle top ~0.32 m in the scene mesh), and the
+    # matching splat Gaussians survive tight y_max too (3,491 bottle-top
+    # ghosts observed empirically above Y=0.239 up to Y=0.462 m). The XZ
+    # footprint is TIGHT (object silhouette + 0.5 cm dilation), so risk of
+    # clipping legitimate scene structure directly above an object on a
+    # desk is small; v11 has already suppressed most floaters.
     footprints = []
     for slug in prompts:
         ply = _require(object_mesh_dir / slug / f"{slug}_extracted.ply",
                        f"extracted obj mesh for {slug}")
         fp = _build_footprint_from_extracted_mesh(
             ply, xz_resolution=0.005, xz_dilate_cm=0.5, y_margin_cm=0.5)
+        fp["y_max"] = fp["y_min"] + 1.0  # 1 m upward extension
         area_cm2 = float(fp["fp_mask"].sum()) * (fp["resolution"] * 100.0) ** 2
         _log(f"  [{slug}] footprint area = {area_cm2:.0f} cm^2, "
-             f"Y in [{fp['y_min']:+.3f}, {fp['y_max']:+.3f}] m")
+             f"Y in [{fp['y_min']:+.3f}, {fp['y_max']:+.3f}] m "
+             f"(y_max extended +1 m for column crop)")
         footprints.append(fp)
 
     # ===== SPLAT side =====
@@ -510,6 +549,13 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
              f"mesh patches will be skipped")
         vs = None
 
+    # SAM3 mask cache for the mesh-patch RGB sampler (prevents object
+    # colour from baking into the patch when a candidate view still shows
+    # the object). Absent-directory case is handled inside
+    # _resample_patch_rgb -> _load_sam3_masks (prints WARN, sam3_guard=off).
+    sam3_cache = project_root / "output" / f"segmented_{scene_name}" / "masks"
+    _log(f"    sam3_cache = {sam3_cache}  (exists={sam3_cache.is_dir()})")
+
     mesh_chunks = [trimmed_mesh]
     n_patch_faces_total = 0
     for slug in prompts:
@@ -517,7 +563,9 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
         if not npz.exists() or vs is None:
             _log(f"    [{slug}] no NPZ at {npz}; skipping mesh patch")
             continue
-        pts_m, rgb01, shape_xz = _resample_patch_rgb(npz, scene_mesh_path, vs)
+        pts_m, rgb01, shape_xz = _resample_patch_rgb(
+            npz, scene_mesh_path, vs,
+            sam3_cache=sam3_cache, prompt_slug=slug)
         patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
         n_patch_faces_total += len(patch_mesh.faces)
         mesh_chunks.append(patch_mesh)

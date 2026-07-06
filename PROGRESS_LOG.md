@@ -554,6 +554,82 @@ unaffected (drops 12,732 Gaussians via object footprints as before).
 
 ---
 
+### 2026-07-06 — scene_without_objects patches fixed (color, placement, ghosts)
+
+**Trigger.** User visually flagged three failure modes in the mesh patches
+that cover the removed-object holes:
+1. **Lobster patch** correctly placed but tinted RED (object colour bleed).
+2. **Bottle patch** correct but a dark **mesh + splat "stub" survives** above
+   the patch (partial object leftover).
+3. **Blue box patch** placed on wrong plane AND tinted BLUE.
+
+**Root causes found + landed.**
+
+- **Fix 1: SAM3 mask guard bypass.** [`_pipeline_full.py`](_pipeline_full.py)
+  `_resample_patch_rgb` was calling `_best_view_per_point(...)` without
+  passing `sam3_masks`. Guard defaulted to `None`, so RGB sampling picked
+  from views where the object was still visible → object colour baked in.
+  Switched to `_topk_views_per_point` + `_sample_color_topk` (top-5 views +
+  per-channel median RGB, robust to mask anti-aliasing edge bleed) and
+  plumbed `sam3_cache = project_root/output/segmented_<scene>/masks` +
+  `prompt_slug` through the call site. Also propagates `desk_normal_metric`
+  from the NPZ when present (improves top-K scoring).
+
+- **Fix 2: blue-box patch placed on wrong plane.**
+  [`_unseen_core_map.py`](_unseen_core_map.py) `fit_local_desk_plane` had a
+  35° tilt guard on the RANSAC-fitted normal to reject wall lock-ins.
+  V32's desk tilts 34.7° for bottle/lobster halos (accepted) but the box
+  halo fit at exactly **35.0°** → rejected → fell back to a flat
+  axis-aligned `y=0.118 m` plane while the real desk near the box is at
+  Y ≈ 0.219 m. Widened guard default to **45°** (walls tilt >70°, so still
+  safe) and exposed `--auto-desk-max-tilt-deg` CLI arg.
+
+- **Fix 3: bottle stub survived above the patch.** Same file, stage 4 was
+  using the extracted-mesh Y_max as the crop's `y_max` (0.234 m for a
+  bottle that's really 32 cm tall — SAM3 misses the translucent top).
+  Now extends `y_max = y_min + 1.0 m` for BOTH the mesh crop AND the splat
+  crop (originally only mesh, but adversarial review found 3,491 splat
+  ghosts above the bottle from Y=0.239 up to 0.462 m — Fix 3 was
+  asymmetric and left the splat side broken). Unified into a single
+  `footprints` list; XZ is still the tight silhouette + 0.5 cm.
+
+- **Fix 4 (from adversarial review): Open3D RANSAC nondeterminism.**
+  `pcd.segment_plane(...)` doesn't accept a seed and Open3D's global RNG
+  wasn't set. So Fix 2's success (blue box passing at exactly 35.0°) was
+  one RNG realization; a re-run could produce 46° and silently regress to
+  flat-plane fallback. Added `o3d.utility.random.seed(0)` at the top of
+  `_unseen_core_map.py::main` (also configurable via `--auto-desk-seed`).
+  Confirmed determinism across two consecutive runs.
+
+**Numerical proof (output/pipeline_v32_v11_patches_v2/).**
+
+| Slug | Old patch mean RGB | New patch mean RGB | Splat ghosts above patch |
+|---|---|---|---:|
+| water bottle | (170, 158, 112) — bleached by white bottle | **(155, 143, 98)** — tan | 0 (was 3,491) |
+| blue box | *0 grid-points matched to mesh* — wrong plane | **(142, 133, 88)** — tan, B lowest ✓ | 0 (was 1,511) |
+| red lobster | (167, 137, 99) — reddish pull | **(159, 138, 92)** — tan | 0 (was 499) |
+
+100 % of NPZ grid points now match mesh patch vertices for every object
+(blue box was 0/960 before Fix 2). SAM3 guard rejected 5,659 - 8,557
+(point, view) pairs per prompt during resampling. Pipeline pass produced
+`output/pipeline_v32_v11_patches_v2/` deliverable.
+
+**Adversarial review verdict (4 parallel agents, workflow `wvvyq0ryz`).**
+Reviewers found three "blocking" issues; two were real (splat-side
+asymmetry + RANSAC nondeterminism, both addressed above) and one was
+empirically false on V32 (reviewer assumed desk sat at world Y ≈ 0 but
+the desk is tilted 35°, so the local desk elevation at each object's XZ
+centroid matches its `Y_min`, not world Y = 0). Non-blocking follow-ups
+noted for later:
+- No assertion that SAM3 mask resolution matches source photo resolution
+  (would silently mis-sample on mixed-res inputs)
+- `_nn_fill_missing` crashes rather than gracefully filling when every
+  point has NaN colour (unrealistic on V32 but worth a guard)
+- Dead code: `_best_view_per_point` + `_sample_color_for_points` no
+  longer called by `_pipeline_full.py` after Fix 1
+
+---
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.
