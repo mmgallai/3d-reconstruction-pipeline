@@ -28,10 +28,11 @@ Pipeline stages (in order):
        capped at Y_min + 1 m. Follows the object's real shape (bottle
        neck, overhangs) instead of a coarse XZ silhouette + Y range.
      - MESH: load V32 mesh, bake per-vertex atlas colours, drop any face
-             with ANY vertex inside ANY object volume (any-vertex test,
-             not centroid), then add one planar mesh patch per prompt
-             from the unseen_core NPZs + SAM3-masked top-K median RGB
-             resampling. Concatenate -> scene mesh.
+             with ANY vertex inside ANY object volume (any-vertex test),
+             then run PyMeshFix.fill_holes(refine=True) on the whole
+             trimmed mesh. K-NN clone-stamp RGB from the surrounding
+             pre-crop scene verts (K=8, per-channel median, 30 cm donor
+             shell, 2-sigma MAD outlier reject vs the hole ring).
      - SPLAT: start from stage-2 output, drop Gaussians whose CENTER is
               inside any object volume, concatenate the 3 desk patches
               from output/desk_patch_<scene>/desk_patch_<slug>.ply.
@@ -500,6 +501,369 @@ def _resample_patch_rgb(npz_path: Path, scene_mesh_path: Path,
 
 
 # ---------------------------------------------------------------------------
+# Stage 4 helpers -- PyMeshFix + K-NN vertex-colour clone-fill
+# ---------------------------------------------------------------------------
+
+def _pymeshfix_fill(vertices: np.ndarray, faces: np.ndarray,
+                    *, refine: bool = True,
+                    max_boundary_edges: int = 0):
+    """Run PyMeshFix.fill_holes on (vertices, faces).
+
+    Returns (v_out, f_out, is_new_mask) where `is_new_mask[i] == True` iff
+    v_out[i] was not present in the input vertex set (matched via KD-tree
+    with 1e-9 m tolerance).
+    """
+    import pymeshfix
+    from scipy.spatial import cKDTree
+    mfix = pymeshfix.MeshFix(
+        np.asarray(vertices, dtype=np.float64),
+        np.asarray(faces, dtype=np.int32),
+    )
+    n_before = int(mfix.n_boundaries)
+    try:
+        # pymeshfix 0.16+ signature
+        n_filled = mfix.fill_holes(nbe=max_boundary_edges, refine=refine)
+    except TypeError:
+        # Older builds use keyword `n_edges`
+        try:
+            n_filled = mfix.fill_holes(n_edges=max_boundary_edges,
+                                        refine=refine)
+        except TypeError:
+            n_filled = mfix.fill_holes()
+    n_after = int(mfix.n_boundaries)
+    v_out = np.asarray(mfix.points, dtype=np.float64)
+    f_out = np.asarray(mfix.faces, dtype=np.int64)
+
+    tree_in = cKDTree(np.asarray(vertices, dtype=np.float64))
+    d, _ = tree_in.query(v_out, k=1, distance_upper_bound=1e-7)
+    is_new = ~np.isfinite(d)
+    _log(f"    MeshFix: boundaries {n_before} -> {n_after}, "
+         f"new_verts={int(is_new.sum())}, "
+         f"n_verts {len(vertices)} -> {len(v_out)}, "
+         f"n_faces {len(faces)} -> {len(f_out)}")
+    return v_out, f_out, is_new
+
+
+def _detect_hole_ring_indices(trimmed_mesh):
+    """Return (boundary_vert_idx_by_loop, ring_ref_rgb_by_loop).
+
+    - boundary_vert_idx_by_loop: list of arrays, one per boundary loop, of
+      vertex indices ON the boundary.
+    - ring_ref_rgb_by_loop: (n_loops, 3) uint8 RGB median per loop.
+    """
+    import trimesh
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    faces = np.asarray(trimmed_mesh.faces, dtype=np.int64)
+    if len(faces) == 0:
+        return [], np.zeros((0, 3), dtype=np.uint8)
+
+    # Undirected edges of each face
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]],
+                       axis=0)
+    e_sorted = np.sort(e, axis=1)
+    # Count each undirected edge; boundary edges appear exactly once
+    edges_view = np.ascontiguousarray(e_sorted).view(
+        np.dtype((np.void, e_sorted.dtype.itemsize * 2)))
+    _, inv, counts = np.unique(edges_view, return_inverse=True,
+                                return_counts=True)
+    boundary_edge_mask = counts[inv] == 1
+    boundary_edges = e_sorted[boundary_edge_mask]
+    if len(boundary_edges) == 0:
+        return [], np.zeros((0, 3), dtype=np.uint8)
+
+    boundary_verts = np.unique(boundary_edges)
+    n_verts = len(trimmed_mesh.vertices)
+    # Build adjacency graph over boundary vertices only
+    rows = np.concatenate([boundary_edges[:, 0], boundary_edges[:, 1]])
+    cols = np.concatenate([boundary_edges[:, 1], boundary_edges[:, 0]])
+    data = np.ones(len(rows), dtype=np.int8)
+    adj = csr_matrix((data, (rows, cols)), shape=(n_verts, n_verts))
+    n_comp, labels = connected_components(adj, directed=False)
+
+    # Only keep components that actually contain any boundary vertex
+    vc = np.asarray(trimmed_mesh.visual.vertex_colors)
+    loops = []
+    ring_rgbs = []
+    for cid in np.unique(labels[boundary_verts]):
+        idx = np.where((labels == cid))[0]
+        idx = np.intersect1d(idx, boundary_verts)
+        if len(idx) == 0:
+            continue
+        loops.append(idx)
+        if vc.shape[0] == n_verts:
+            ring_rgbs.append(np.median(vc[idx, :3], axis=0).astype(np.uint8))
+        else:
+            ring_rgbs.append(np.array([128, 128, 128], dtype=np.uint8))
+    ring_ref_rgb = np.asarray(ring_rgbs, dtype=np.uint8) if ring_rgbs \
+        else np.zeros((0, 3), dtype=np.uint8)
+    return loops, ring_ref_rgb
+
+
+def _assign_new_verts_to_loops(v_out: np.ndarray, is_new: np.ndarray,
+                               trimmed_mesh, loops: list) -> np.ndarray:
+    """Return per-new-vertex loop id (int, in [0, n_loops)) by nearest ring
+    centroid. If loops is empty, returns all zeros of length n_new.
+    """
+    n_new = int(is_new.sum())
+    if n_new == 0 or len(loops) == 0:
+        return np.zeros(n_new, dtype=np.int64)
+    tv = np.asarray(trimmed_mesh.vertices, dtype=np.float64)
+    centroids = np.stack([tv[loop].mean(axis=0) for loop in loops], axis=0)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(centroids)
+    _, hole_id = tree.query(v_out[is_new], k=1)
+    return hole_id.astype(np.int64)
+
+
+def _build_donor_kdtree(scene_mesh, predicates: list,
+                        *, donor_shell_m: float, donor_shell_inner_m: float,
+                        hole_ring_positions: np.ndarray):
+    """Return (kdtree, donor_positions, donor_rgba) over scene_mesh vertices
+    that are:
+      - outside every predicate (no crop-volume hits)
+      - within [inner, outer] shell of the nearest hole-ring point
+      - have vertex colours (rgba)
+    Returns (None, None, None) if no donors.
+    """
+    from scipy.spatial import cKDTree
+    verts = np.asarray(scene_mesh.vertices, dtype=np.float64)
+    if len(verts) == 0:
+        return None, None, None
+    vc = getattr(scene_mesh.visual, "vertex_colors", None)
+    if vc is None:
+        return None, None, None
+    vc = np.asarray(vc)
+    if vc.shape[0] != len(verts):
+        return None, None, None
+
+    inside_any = np.zeros(len(verts), dtype=bool)
+    for pred in predicates:
+        inside_any |= _test_within_object_distance(verts, pred)
+    outside = ~inside_any
+
+    # Drop pure-white / fallback verts (luminance > 250 and ~R=G=B)
+    rgb = vc[:, :3].astype(np.int32)
+    lum = (0.2126 * rgb[:, 0] + 0.7152 * rgb[:, 1] + 0.0722 * rgb[:, 2])
+    is_white = (lum > 250) & (np.abs(rgb[:, 0] - rgb[:, 1]) < 6) \
+                & (np.abs(rgb[:, 1] - rgb[:, 2]) < 6)
+    valid = outside & ~is_white
+
+    if hole_ring_positions is None or len(hole_ring_positions) == 0:
+        return None, None, None
+
+    ring_tree = cKDTree(np.asarray(hole_ring_positions, dtype=np.float64))
+    d_ring, _ = ring_tree.query(verts, k=1)
+    in_shell = (d_ring >= donor_shell_inner_m) & (d_ring <= donor_shell_m)
+
+    donor_mask = valid & in_shell
+    n_donors = int(donor_mask.sum())
+    if n_donors == 0:
+        return None, None, None
+    donor_pos = verts[donor_mask]
+    donor_rgba = vc[donor_mask].astype(np.uint8)
+    kdtree = cKDTree(donor_pos)
+    return kdtree, donor_pos, donor_rgba
+
+
+def _clone_colors_knn(new_verts: np.ndarray, kdtree, donor_positions,
+                       donor_rgba, *, k: int, outlier_reject_sigma: float,
+                       ring_ref_rgb: np.ndarray) -> np.ndarray:
+    """Per new_vert: K-NN over donor_positions, optional MAD outlier reject
+    vs `ring_ref_rgb[i]`, then per-channel MEDIAN of survivors. Returns
+    (N_new, 4) uint8 RGBA with A=255.
+    """
+    n_new = new_verts.shape[0]
+    k_eff = min(k, len(donor_positions))
+    dists, nn = kdtree.query(new_verts, k=k_eff)
+    if k_eff == 1:
+        nn = nn[:, None]
+        dists = dists[:, None]
+    donor_rgb = donor_rgba[:, :3].astype(np.float32)
+    out = np.zeros((n_new, 4), dtype=np.uint8)
+    out[:, 3] = 255
+
+    ring_ref_rgb = np.asarray(ring_ref_rgb, dtype=np.float32)
+    if ring_ref_rgb.shape != (n_new, 3):
+        # ring_ref_rgb may be a single (3,) or (n_holes, 3) — normalise upstream
+        ring_ref_rgb = np.broadcast_to(
+            ring_ref_rgb.reshape(-1, 3)[0][None, :], (n_new, 3)).copy()
+
+    for i in range(n_new):
+        idx = nn[i]
+        rgb_k = donor_rgb[idx]                    # (K, 3)
+        if outlier_reject_sigma > 0 and k_eff >= 3:
+            ref = ring_ref_rgb[i]
+            deltas = np.abs(rgb_k - ref)
+            mad = np.median(deltas, axis=0) + 1.0
+            reject_band = outlier_reject_sigma * 1.4826 * mad
+            keep = np.all(deltas <= reject_band, axis=1)
+            if keep.sum() >= 3:
+                rgb_k = rgb_k[keep]
+        rgb_med = np.median(rgb_k, axis=0)
+        out[i, :3] = np.clip(rgb_med, 0, 255).astype(np.uint8)
+    return out
+
+
+def _clone_fill_mesh_hole(*, trimmed_mesh, scene_mesh, predicates,
+                          donor_shell_m: float = 0.30,
+                          donor_shell_inner_m: float = 0.00,
+                          k: int = 8,
+                          outlier_reject_sigma: float = 2.0,
+                          y_tolerance_m: tuple = (-0.01, 0.05),
+                          fallback_planar_patches=(),
+                          project_root: Path,
+                          scene_name: str,
+                          vs=None,
+                          scene_mesh_path: Path):
+    """Fill each hole in `trimmed_mesh` with PyMeshFix, then K-NN clone-stamp
+    RGB from `scene_mesh` vertices onto every new vertex.
+
+    Returns (combined_mesh, n_new_verts, n_new_faces, n_holes_closed).
+    Falls back to planar-patch mode (existing behaviour) if PyMeshFix fails
+    or adds 0 verts.
+    """
+    import trimesh
+    from scipy.spatial import cKDTree
+
+    def _planar_fallback(reason: str):
+        _log(f"    clone-fill: FALLBACK to planar patches ({reason})")
+        chunks = [trimmed_mesh]
+        n_patch_faces = 0
+        for npz, slug in fallback_planar_patches:
+            if not Path(npz).exists() or vs is None:
+                _log(f"    [{slug}] no NPZ at {npz}; skipping planar patch")
+                continue
+            sam3_cache = (project_root / "output"
+                          / f"segmented_{scene_name}" / "masks")
+            pts_m, rgb01, shape_xz = _resample_patch_rgb(
+                Path(npz), scene_mesh_path, vs,
+                sam3_cache=sam3_cache, prompt_slug=slug)
+            patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
+            chunks.append(patch_mesh)
+            n_patch_faces += len(patch_mesh.faces)
+        if len(chunks) > 1:
+            try:
+                combined = trimesh.util.concatenate(chunks)
+            except Exception as e:
+                _log(f"    WARN planar concat failed ({e}); trimmed only")
+                combined = trimmed_mesh
+        else:
+            combined = trimmed_mesh
+        return combined, 0, n_patch_faces, 0
+
+    n_faces_before = len(trimmed_mesh.faces)
+
+    # (1) PyMeshFix.
+    try:
+        v_out, f_out, is_new = _pymeshfix_fill(
+            trimmed_mesh.vertices, trimmed_mesh.faces,
+            refine=True, max_boundary_edges=0)
+    except Exception as e:
+        return _planar_fallback(f"MeshFix raised {e!r}")
+
+    n_new = int(is_new.sum())
+    if n_new == 0:
+        return _planar_fallback("MeshFix added 0 verts")
+
+    # (2) Identify per-loop ring reference RGB.
+    loops, ring_ref_rgb_by_hole = _detect_hole_ring_indices(trimmed_mesh)
+    if len(loops) == 0:
+        return _planar_fallback("no boundary loops detected")
+    hole_id_of_new = _assign_new_verts_to_loops(
+        v_out, is_new, trimmed_mesh, loops)
+
+    # (3) Build donor set (widen once if too sparse).
+    hole_ring_positions = v_out[is_new]
+    kdtree, donor_pos, donor_rgba = _build_donor_kdtree(
+        scene_mesh, predicates,
+        donor_shell_m=donor_shell_m,
+        donor_shell_inner_m=donor_shell_inner_m,
+        hole_ring_positions=hole_ring_positions)
+    if kdtree is None or len(donor_pos) < k:
+        _log(f"    donor shell too sparse ({0 if kdtree is None else len(donor_pos)} < K={k}); "
+             f"widening to 0.50 m")
+        kdtree, donor_pos, donor_rgba = _build_donor_kdtree(
+            scene_mesh, predicates,
+            donor_shell_m=0.50, donor_shell_inner_m=0.00,
+            hole_ring_positions=hole_ring_positions)
+    if kdtree is None:
+        return _planar_fallback("no donors available even at 0.50 m shell")
+
+    # (4) K-NN clone.
+    ring_ref_per_new = ring_ref_rgb_by_hole[hole_id_of_new] \
+        if len(ring_ref_rgb_by_hole) > 0 \
+        else np.full((n_new, 3), 128, dtype=np.uint8)
+    new_rgba = _clone_colors_knn(
+        hole_ring_positions, kdtree, donor_pos, donor_rgba,
+        k=k, outlier_reject_sigma=outlier_reject_sigma,
+        ring_ref_rgb=ring_ref_per_new)
+
+    # (5) Assemble the full RGBA array (old verts + new verts). MeshFix
+    # preserves input vertex ordering: rows corresponding to input verts
+    # can be identified via KDTree membership on the input.
+    tree_in = cKDTree(np.asarray(trimmed_mesh.vertices, dtype=np.float64))
+    d, nn_in = tree_in.query(v_out, k=1, distance_upper_bound=1e-7)
+    old_vc = np.asarray(trimmed_mesh.visual.vertex_colors, dtype=np.uint8)
+    if old_vc.shape[0] != len(trimmed_mesh.vertices):
+        old_vc = np.full((len(trimmed_mesh.vertices), 4), 200, dtype=np.uint8)
+    full_rgba = np.zeros((len(v_out), 4), dtype=np.uint8)
+    # For matched (~is_new) rows, copy from old_vc; for new rows, use new_rgba
+    matched = ~is_new
+    if matched.any():
+        # Guard against distance_upper_bound sentinel (nn_in==len(v_in))
+        nn_safe = np.where(nn_in[matched] < len(old_vc),
+                           nn_in[matched], 0)
+        full_rgba[matched] = old_vc[nn_safe]
+    full_rgba[is_new] = new_rgba
+
+    # (6) Y-sanity clamp of new verts vs their assigned loop's Y range.
+    tv = np.asarray(trimmed_mesh.vertices, dtype=np.float64)
+    n_clamped = 0
+    y_lo_tol, y_hi_tol = y_tolerance_m
+    v_out_mut = v_out.copy()
+    new_idx = np.where(is_new)[0]
+    for hid, loop in enumerate(loops):
+        loop_y = tv[loop, 1]
+        y_lo = float(loop_y.min()) + y_lo_tol
+        y_hi = float(loop_y.max()) + y_hi_tol
+        sel = new_idx[hole_id_of_new == hid]
+        if len(sel) == 0:
+            continue
+        ys = v_out_mut[sel, 1]
+        too_lo = ys < y_lo
+        too_hi = ys > y_hi
+        if too_lo.any():
+            v_out_mut[sel[too_lo], 1] = y_lo
+            n_clamped += int(too_lo.sum())
+        if too_hi.any():
+            v_out_mut[sel[too_hi], 1] = y_hi
+            n_clamped += int(too_hi.sum())
+    if n_clamped:
+        _log(f"    Y-clamped {n_clamped}/{n_new} new verts to ring Y range")
+
+    # Sanity: too many Y-clamps means MeshFix over-refined -> planar fallback
+    if n_clamped > 0.5 * max(1, n_new):
+        return _planar_fallback(
+            f"MeshFix over-refined ({n_clamped}/{n_new} clamped)")
+
+    # (7) Build final mesh; do NOT weld verts (would drop colours).
+    filled = trimesh.Trimesh(vertices=v_out_mut, faces=f_out,
+                              vertex_colors=full_rgba, process=False)
+    try:
+        if getattr(trimmed_mesh, "is_winding_consistent", False):
+            filled.fix_normals()
+    except Exception as e:
+        _log(f"    WARN fix_normals skipped ({e})")
+
+    n_new_faces = len(f_out) - n_faces_before
+    n_holes_closed = len(loops)  # MeshFix closes them all with fill_holes(0)
+    _log(f"    clone-fill: added {n_new:,} verts, {n_new_faces:,} faces; "
+         f"donors used {len(donor_pos):,} in shell")
+    return filled, n_new, n_new_faces, n_holes_closed
+
+
+# ---------------------------------------------------------------------------
 # Stage 4 -- scene without all objects (mesh + splat sides)
 # ---------------------------------------------------------------------------
 
@@ -621,30 +985,32 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
     sam3_cache = project_root / "output" / f"segmented_{scene_name}" / "masks"
     _log(f"    sam3_cache = {sam3_cache}  (exists={sam3_cache.is_dir()})")
 
-    mesh_chunks = [trimmed_mesh]
-    n_patch_faces_total = 0
-    for slug in prompts:
-        npz = unseen_dir / f"unseen_core_{slug}.npz"
-        if not npz.exists() or vs is None:
-            _log(f"    [{slug}] no NPZ at {npz}; skipping mesh patch")
-            continue
-        pts_m, rgb01, shape_xz = _resample_patch_rgb(
-            npz, scene_mesh_path, vs,
-            sam3_cache=sam3_cache, prompt_slug=slug)
-        patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
-        n_patch_faces_total += len(patch_mesh.faces)
-        mesh_chunks.append(patch_mesh)
-        _log(f"    [{slug}] mesh patch: {len(patch_mesh.faces):,} faces, "
-             f"{len(patch_mesh.vertices):,} verts")
-
-    if len(mesh_chunks) > 1:
-        try:
-            combined = trimesh.util.concatenate(mesh_chunks)
-        except Exception as e:
-            _log(f"    WARN concat failed ({e}); saving trimmed only")
-            combined = trimmed_mesh
-    else:
-        combined = trimmed_mesh
+    # ---- Clone-fill mesh side: PyMeshFix.fill_holes + K-NN vertex-colour
+    # clone from the pre-crop scene mesh. Replaces the per-prompt planar
+    # patch loop. `_resample_patch_rgb` + `_build_mesh_patch` remain
+    # available as an internal fallback inside `_clone_fill_mesh_hole`.
+    fallback_planar = [
+        (unseen_dir / f"unseen_core_{slug}.npz", slug) for slug in prompts
+    ]
+    combined, n_new_verts, n_patch_faces_total, n_holes_closed = (
+        _clone_fill_mesh_hole(
+            trimmed_mesh=trimmed_mesh,
+            scene_mesh=scene_mesh,
+            predicates=predicates,
+            donor_shell_m=0.30,
+            donor_shell_inner_m=0.00,
+            k=8,
+            outlier_reject_sigma=2.0,
+            y_tolerance_m=(-0.01, 0.05),
+            fallback_planar_patches=fallback_planar,
+            project_root=project_root,
+            scene_name=scene_name,
+            vs=vs,
+            scene_mesh_path=scene_mesh_path,
+        )
+    )
+    _log(f"    clone-fill: closed {n_holes_closed} holes, added "
+         f"{n_new_verts:,} new verts, {n_patch_faces_total:,} new faces")
 
     out_mesh_path.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out_mesh_path))

@@ -689,6 +689,87 @@ count within 5 cm is 0 across mesh and splat.
 
 ---
 
+### 2026-07-06 (later 2) — Q2 clone-fill: mesh + splat use nearby desk data as the "eyedropper" source
+
+**Trigger.** User rejected v4 output: blue-tinted craters around each patch.
+After research review (workflow `wykz6i817`), user chose the Q2 approach
+(Photoshop-style eyedropper / clone from nearby desk) over Q3 (diffusion
+reference-guided). Constraints: no new photos, retrain OK if needed,
+fully automated, open source only.
+
+**Mesh side.** [`_pipeline_full.py`](_pipeline_full.py) stage 4 replaces
+the planar-grid mesh patch + view-sampled RGB with PyMeshFix hole-fill
++ K-NN vertex-color clone. Concretely:
+
+1. Cut the object volume as before (3D distance <= 5 cm to extracted mesh).
+2. Run `pymeshfix.MeshFix.fill_holes(refine=True)` on the whole trimmed
+   scene mesh — fills all boundary loops with interpolated ring geometry
+   (real Y, not fitted plane -> elevation matches surrounding desk).
+3. For each newly-added vertex, K-NN (K=8, per-channel median) clone RGB
+   from the surrounding pre-crop scene vertices, restricted to a donor
+   shell (default 5-30 cm from any hole ring) with 2-sigma MAD outlier
+   rejection vs the local ring median.
+
+**Splat side.** [`_seed_desk_patch.py`](_seed_desk_patch.py) added a
+`--mode clone` (default) that replaces the old view-sampling with K-NN
+Gaussian-property clone:
+
+1. Donor set = scene splat Gaussians (a) outside every object 3D crop
+   (dist > 5 cm), (b) within a shell (dist < 30 cm from some object),
+   (c) with Y <= max(object Y_min) + `--donor-y-ceiling-m`.
+2. For each NPZ grid point, find K nearest donors and:
+   - SH DC + rest = per-channel median
+   - scale (log-space) = per-axis median
+   - opacity (logit) = median
+   - rotation = single nearest donor's quaternion
+
+**First-pass bug (Y ceiling too tight).** Default `--donor-y-ceiling-m
+0.05` produced ceiling = max(object Y_min) + 0.05 = 0.222 m for V32, but
+the tilted desk's patch grid Y ranges up to 0.339 m for the bottle. So
+K=8 nearest pulled donors from ABOVE-ceiling (excluded) or from below
+the desk (subterranean / shadow). Fixed by:
+
+1. Widening default `--donor-y-ceiling-m` from 0.05 to 0.30 m
+   (now covers full patch Y span + margin).
+2. Widening default `--donor-k` from 8 to 200 (each grid point averages
+   over ~200 donors instead of 8 local, which dilutes any local
+   shadow-bias cluster; per-object donor pool median matches the
+   surrounding desk ring color exactly, so K=200 gives essentially
+   the pool median).
+
+**Numerical proof (output/pipeline_v32_v11_patches_v5d/).**
+
+Splat patch mean RGB vs surrounding desk ring RGB (5-20 cm shell):
+
+| Slug | Ring RGB | Patch RGB | Delta (per channel) |
+|---|---|---|---|
+| white_water_bottle | (163, 152, 105) | (171, 158, 109) | (+7.5, +5.7, +4.0) |
+| blue_box | (155, 143, 97) | (158, 145, 96) | (+2.7, +2.4, -0.5) |
+| red_lobster_figurine | (169, 155, 105) | (168, 152, 100) | (-1.2, -2.9, -5.0) |
+
+All three within ±8 RGB per channel. For comparison, v5 first pass
+(K=8, Y_ceil=0.05) had blue_box Δ = (-30, -30, -23) (heavy darkening);
+v5b (Y_ceil=0.30 only) had (-25, -20, -15); v5d (K=200) has (+3, +2, -0).
+
+Mesh side (verified by earlier workflow `wttb6kq0n`, reviewer A):
+- Bottle patch RGB Δ = 5.1 max/channel vs ring (PASS <10)
+- Blue box patch RGB Δ = <5 (PASS)
+- Lobster patch RGB Δ = <5 (PASS)
+- Zero residual object-palette vertices in any patch
+- Patch elevation p95 |ΔY| = 5.9 mm vs ring (PASS <30 mm)
+
+**Non-blocking followups (from adversarial review):**
+- 216 sub-cm pinholes still present (max 5.7 mm perimeter, cosmetic).
+- Mesh doubled to 47.8 MB / 2.35M faces because MeshFix filled all
+  23k boundary loops in the scene mesh, not just the 3 object holes.
+  Verify Quest 3 face budget vs restrict to per-object submeshes.
+- SH-DC spread warning triggers for all points (K=200 has wide RGB
+  spread by design); threshold should be relaxed.
+- Dead code: view-sampling paths remain but unused (mode=views still
+  callable via CLI).
+
+---
+
 **ACMM — BLOCKED on Windows build chain, multiple-hour port required.**
 - CMakeLists targets ancient `cmake_minimum_required(2.8)` — modern CMake removed compatibility (need `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` workaround, or modernize).
 - `find_package(CUDA)` was removed in CMake 4.x (replaced by `FindCUDAToolkit`). Even with the `cmake_minimum` workaround, configure fails on `Specify CUDA_TOOLKIT_ROOT_DIR`.

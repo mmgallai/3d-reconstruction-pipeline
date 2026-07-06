@@ -497,6 +497,210 @@ def _build_patch_ply(positions_splat: np.ndarray, rgb01: np.ndarray,
     PlyData([el]).write(str(out_path))
 
 
+# ---------------------------------------------------------------------------
+# Clone-mode helpers (K-NN Gaussian clone from surrounding scene splat)
+# ---------------------------------------------------------------------------
+
+def _splat_to_metric(positions_splat: np.ndarray,
+                     R: np.ndarray, t: np.ndarray,
+                     dp_scale: float, colmap_to_metric: float) -> np.ndarray:
+    """Inverse of `_metric_to_splat`: splat -> metric metres.
+
+    Forward chain: splat = dp_scale * (R @ (metric/colmap_to_metric) + t)
+    Inverse:      metric = colmap_to_metric * R.T @ (splat/dp_scale - t)
+    """
+    colmap_pos = (R.T @ (positions_splat / dp_scale - t).T).T
+    return (colmap_pos * colmap_to_metric).astype(np.float64)
+
+
+def _load_scene_splat_metric(scene_splat_path: Path,
+                             R: np.ndarray, t: np.ndarray,
+                             dp_scale: float, colmap_to_metric: float):
+    """Load the trained scene splat PLY, return:
+      scene_arr:         (N, F) float32 rows (all properties, in PLY order)
+      name_to_col:       {property_name: col_index}
+      centres_metric:    (N, 3) float64 Gaussian centres in metric metres
+      header_template:   str, a PLY header that matches this schema (used
+                         to write the patch back in identical dtype)
+    """
+    pd = PlyData.read(str(scene_splat_path))
+    v = pd["vertex"]
+    prop_names = [p.name for p in v.properties]
+    # sanity: SH degree 3 -> 45 f_rest_*
+    n_rest = sum(1 for p in prop_names if p.startswith("f_rest_"))
+    if n_rest != 45:
+        raise RuntimeError(
+            f"scene splat at {scene_splat_path} has {n_rest} f_rest_* props; "
+            f"expected 45 (SH degree 3). Patch PLY_FIELDS is hard-coded to 45.")
+    if prop_names != list(PLY_FIELDS):
+        # Not fatal — as long as they're the same set. We use name_to_col.
+        missing = set(PLY_FIELDS) - set(prop_names)
+        extra = set(prop_names) - set(PLY_FIELDS)
+        if missing or extra:
+            raise RuntimeError(
+                f"scene splat property set mismatch: missing={missing}, "
+                f"extra={extra}")
+    n = len(v.data)
+    F = len(prop_names)
+    scene_arr = np.empty((n, F), dtype=np.float32)
+    name_to_col = {}
+    for c, name in enumerate(prop_names):
+        scene_arr[:, c] = np.asarray(v.data[name], dtype=np.float32)
+        name_to_col[name] = c
+    pos_splat = np.stack(
+        [v.data["x"], v.data["y"], v.data["z"]], axis=-1).astype(np.float64)
+    centres_metric = _splat_to_metric(
+        pos_splat, R, t, dp_scale, colmap_to_metric)
+    return scene_arr, name_to_col, centres_metric, prop_names
+
+
+def _select_donor_mask(scene_centres_metric: np.ndarray,
+                       object_mesh_paths: list,
+                       inner_m: float,
+                       outer_m: float,
+                       y_ceiling_offset_m: float) -> np.ndarray:
+    """Compute the donor mask over scene Gaussians.
+
+    A Gaussian is a donor iff its metric centre:
+      - is > inner_m from EVERY object mesh (i.e. not inside the crop volume)
+      - is < outer_m from AT LEAST ONE object mesh (within the shell)
+      - has Y <= (min over object meshes of y_min) + y_ceiling_offset_m
+    """
+    import open3d as o3d
+    import trimesh as _tm
+    n = len(scene_centres_metric)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    pts32 = scene_centres_metric.astype(np.float32)
+    pts_t = o3d.core.Tensor(pts32)
+
+    d_min_all = np.full(n, np.inf, dtype=np.float32)
+    y_ceilings = []
+    for mp in object_mesh_paths:
+        m = _tm.load(str(mp), force="mesh", process=False)
+        verts = np.asarray(m.vertices, dtype=np.float32)
+        faces = np.asarray(m.faces, dtype=np.uint32)
+        tm = o3d.t.geometry.TriangleMesh()
+        tm.vertex.positions = o3d.core.Tensor(verts)
+        tm.triangle.indices = o3d.core.Tensor(faces)
+        rs = o3d.t.geometry.RaycastingScene()
+        rs.add_triangles(tm)
+        d = rs.compute_distance(pts_t).numpy()
+        d_min_all = np.minimum(d_min_all, d)
+        y_ceilings.append(float(verts[:, 1].min()) + float(y_ceiling_offset_m))
+
+    outside_inner = d_min_all > inner_m
+    inside_outer = d_min_all < outer_m
+    # Y ceiling: keep only donors at or below the highest object's floor + offset
+    y_ceiling = max(y_ceilings) if y_ceilings else np.inf
+    below_ceiling = scene_centres_metric[:, 1] <= y_ceiling
+    return outside_inner & inside_outer & below_ceiling
+
+
+def _clone_gaussian_from_donors(pts_metric_grid: np.ndarray,
+                                pts_splat_grid: np.ndarray,
+                                scene_arr: np.ndarray,
+                                scene_name_to_idx: dict,
+                                donor_mask: np.ndarray,
+                                donor_centres_metric: np.ndarray,
+                                k: int = 8,
+                                rot_mode: str = "nearest") -> np.ndarray:
+    """K-NN clone-stamp Gaussian properties from `scene_arr` donors onto each
+    grid point. Returns (P, F) rows in the same column order as scene_arr.
+
+    Positions (x, y, z) come from `pts_splat_grid`; normals are zeroed.
+    Colours (f_dc, f_rest), scales, opacity: per-channel MEDIAN of K donors
+    (median in log/logit space where applicable). Rotation: nearest donor
+    (rot_mode='nearest') or sign-corrected quaternion average ('avg').
+    """
+    from scipy.spatial import cKDTree
+    donor_idx_all = np.where(donor_mask)[0]
+    if donor_idx_all.size == 0:
+        raise RuntimeError(
+            "No donor Gaussians in shell; widen --donor-outer-m or check "
+            "--object-mesh-dir / --scene-splat inputs.")
+    tree = cKDTree(donor_centres_metric[donor_idx_all])
+
+    # Column groups
+    rot_cols = [scene_name_to_idx[f"rot_{i}"] for i in range(4)]
+    sh_cols = ([scene_name_to_idx[f"f_dc_{i}"] for i in range(3)]
+               + [scene_name_to_idx[f"f_rest_{i}"] for i in range(45)])
+    scale_cols = [scene_name_to_idx[f"scale_{i}"] for i in range(3)]
+    op_col = scene_name_to_idx["opacity"]
+    x_col = scene_name_to_idx["x"]
+    y_col = scene_name_to_idx["y"]
+    z_col = scene_name_to_idx["z"]
+
+    P = pts_metric_grid.shape[0]
+    F = scene_arr.shape[1]
+    out = np.zeros((P, F), dtype=np.float32)
+
+    # Positions in splat space
+    out[:, x_col] = pts_splat_grid[:, 0].astype(np.float32)
+    out[:, y_col] = pts_splat_grid[:, 1].astype(np.float32)
+    out[:, z_col] = pts_splat_grid[:, 2].astype(np.float32)
+    # Normals stay at 0 (nx, ny, nz)
+
+    K_eff = min(k, donor_idx_all.size)
+    dists, nn_local = tree.query(pts_metric_grid, k=K_eff)
+    if K_eff == 1:
+        nn_local = nn_local[:, None]
+        dists = dists[:, None]
+    nn = donor_idx_all[nn_local]  # (P, K) global indices
+
+    # SH DC + rest: per-channel median across K
+    sh_stack = scene_arr[nn][:, :, sh_cols]           # (P, K, 48)
+    out[:, sh_cols] = np.median(sh_stack, axis=1).astype(np.float32)
+
+    # Scale: per-axis median in log space
+    sc_stack = scene_arr[nn][:, :, scale_cols]        # (P, K, 3)
+    out[:, scale_cols] = np.median(sc_stack, axis=1).astype(np.float32)
+
+    # Opacity: median in logit space
+    op_stack = scene_arr[nn][:, :, op_col]            # (P, K)
+    out[:, op_col] = np.median(op_stack, axis=1).astype(np.float32)
+
+    # Rotation
+    if rot_mode == "nearest":
+        out[:, rot_cols] = scene_arr[nn[:, 0]][:, rot_cols]
+    else:  # 'avg' — sign-corrected quaternion mean
+        qs = scene_arr[nn][:, :, rot_cols]                        # (P, K, 4)
+        ref = qs[:, 0:1, :]
+        dots = np.sum(qs * ref, axis=-1, keepdims=True)
+        signs = np.where(dots >= 0, 1.0, -1.0).astype(np.float32)
+        qs = qs * signs
+        m = qs.mean(axis=1)
+        m /= (np.linalg.norm(m, axis=1, keepdims=True) + 1e-9)
+        out[:, rot_cols] = m.astype(np.float32)
+
+    # Diagnostic: high SH-DC spread flag
+    if K_eff >= 2:
+        max_spread = (sh_stack[:, :, :3].max(axis=1)
+                      - sh_stack[:, :, :3].min(axis=1)).max(axis=1)
+        n_noisy = int((max_spread > 0.15).sum())
+        if n_noisy:
+            print(f"    WARN {n_noisy}/{P} grid points sit at a colour "
+                  f"boundary (K-neighbour SH-DC spread > 0.15); median used")
+    return out
+
+
+def _build_clone_patch_ply(rows: np.ndarray,
+                           prop_names: list,
+                           out_path: Path) -> None:
+    """Write a structured PLY where the vertex element has one column per
+    entry in `prop_names`, filled from `rows` (P x F float32) in column order.
+    """
+    P, F = rows.shape
+    assert F == len(prop_names), (F, len(prop_names))
+    dtype = [(name, "f4") for name in prop_names]
+    out_rows = np.empty(P, dtype=dtype)
+    for c, name in enumerate(prop_names):
+        out_rows[name] = rows[:, c]
+    el = PlyElement.describe(out_rows, "vertex")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    PlyData([el]).write(str(out_path))
+
+
 def process_object(slug: str, npz_path: Path, view_source,
                    scene_mesh_path: Path, dp_R, dp_t, dp_scale,
                    colmap_to_metric: float,
@@ -504,8 +708,18 @@ def process_object(slug: str, npz_path: Path, view_source,
                    opacity: float, out_dir: Path,
                    sam3_cache: Path | None = None,
                    sam3_dilate_px: int = 8,
-                   topk_views: int = 5):
-    print(f"\n=== {slug} ===")
+                   topk_views: int = 5,
+                   *,
+                   mode: str = "clone",
+                   scene_splat_path: Path | None = None,
+                   object_mesh_dir: Path | None = None,
+                   all_object_slugs: list | None = None,
+                   donor_inner_m: float = 0.05,
+                   donor_outer_m: float = 0.30,
+                   donor_y_ceiling_m: float = 0.05,
+                   donor_k: int = 200,
+                   rot_mode: str = "nearest"):
+    print(f"\n=== {slug}  [mode={mode}] ===")
     if not npz_path.exists():
         print(f"  missing {npz_path}; run _unseen_core_map.py first")
         return None
@@ -531,6 +745,80 @@ def process_object(slug: str, npz_path: Path, view_source,
         desk_normal_metric = np.array([0.0, 1.0, 0.0])
         print(f"  desk normal METRIC: world +Y (no auto-fit in NPZ)")
 
+    # Common: transform grid points metric -> splat space
+    pts_s = _metric_to_splat(pts_m, dp_R, dp_t, dp_scale, colmap_to_metric)
+
+    # ================================================================
+    # CLONE MODE — K-NN Gaussian clone from the surrounding scene splat.
+    # ================================================================
+    if mode == "clone":
+        if scene_splat_path is None or not Path(scene_splat_path).exists():
+            raise RuntimeError(
+                f"clone mode needs --scene-splat; got {scene_splat_path}")
+        if object_mesh_dir is None:
+            raise RuntimeError(
+                "clone mode needs --object-mesh-dir")
+        slug_list = list(all_object_slugs) if all_object_slugs else [slug]
+        object_mesh_paths = [
+            Path(object_mesh_dir) / s / f"{s}_extracted.ply"
+            for s in slug_list
+        ]
+        missing = [p for p in object_mesh_paths if not p.exists()]
+        if missing:
+            raise RuntimeError(
+                f"missing object mesh(es) for clone mode: {missing}")
+
+        print(f"  clone mode: loading scene splat {scene_splat_path}")
+        scene_arr, name_to_col, scene_centres_m, prop_names = (
+            _load_scene_splat_metric(Path(scene_splat_path),
+                                     dp_R, dp_t, dp_scale, colmap_to_metric))
+        print(f"    scene splat: {scene_arr.shape[0]:,} gaussians, "
+              f"{scene_arr.shape[1]} props")
+
+        print(f"    computing donor mask (inner={donor_inner_m*100:.1f} cm, "
+              f"outer={donor_outer_m*100:.1f} cm, y_ceil={donor_y_ceiling_m*100:.1f} cm) "
+              f"against {len(object_mesh_paths)} object meshes...")
+        donor_mask = _select_donor_mask(
+            scene_centres_m, object_mesh_paths,
+            inner_m=donor_inner_m,
+            outer_m=donor_outer_m,
+            y_ceiling_offset_m=donor_y_ceiling_m)
+        n_donors = int(donor_mask.sum())
+        print(f"    donors: {n_donors:,}/{scene_arr.shape[0]:,}")
+
+        if n_donors < donor_k:
+            print(f"    WARN <K donors ({n_donors} < {donor_k}); "
+                  f"widening --donor-outer-m to 2*={donor_outer_m*2:.2f} m")
+            donor_mask = _select_donor_mask(
+                scene_centres_m, object_mesh_paths,
+                inner_m=donor_inner_m,
+                outer_m=donor_outer_m * 2.0,
+                y_ceiling_offset_m=donor_y_ceiling_m)
+            n_donors = int(donor_mask.sum())
+            print(f"    donors after widen: {n_donors:,}")
+
+        print(f"    K-NN clone (K={donor_k}, rot_mode={rot_mode}) "
+              f"for {n_total} grid points ...")
+        rows = _clone_gaussian_from_donors(
+            pts_metric_grid=pts_m,
+            pts_splat_grid=pts_s,
+            scene_arr=scene_arr,
+            scene_name_to_idx=name_to_col,
+            donor_mask=donor_mask,
+            donor_centres_metric=scene_centres_m,
+            k=donor_k,
+            rot_mode=rot_mode,
+        )
+        out_path = out_dir / f"desk_patch_{slug}.ply"
+        _build_clone_patch_ply(rows, prop_names, out_path)
+        sz = out_path.stat().st_size / 1024
+        print(f"  wrote {out_path}  ({n_total} gaussians, {sz:.1f} KB) "
+              f"[cloned from {n_donors:,} donors]")
+        return out_path
+
+    # ================================================================
+    # VIEWS MODE — legacy top-K view-median SH-DC seed (kept as fallback).
+    # ================================================================
     sam3_masks = None
     if sam3_cache is not None:
         view_names = [v.name for v in view_source.all_views()]
@@ -551,9 +839,6 @@ def process_object(slug: str, npz_path: Path, view_source,
     print(f"  sampled colour for {n_have_color}/{n_total}")
 
     rgb01 = _nn_fill_missing(pts_m, rgb01)
-
-    # Transform metric -> splat space
-    pts_s = _metric_to_splat(pts_m, dp_R, dp_t, dp_scale, colmap_to_metric)
 
     # Splat-space desk normal: apply R only (no translation, no scale).
     # Uses the fitted (or fallback) metric normal from above.
@@ -622,6 +907,32 @@ def main():
                    help="Use the K best-scoring views per grid point and "
                         "median their RGB samples. Robust to a single bleed-"
                         "through outlier. K=1 = old single-best-view behaviour.")
+
+    # --- clone-mode options (mode == 'clone' is the new default) ---
+    p.add_argument("--mode", choices=("clone", "views"), default="clone",
+                   help="'clone' (default) K-NN clones Gaussians from the "
+                        "surrounding scene splat; 'views' is the legacy "
+                        "top-K view-median-RGB seed.")
+    p.add_argument("--scene-splat", type=Path, default=None,
+                   help="Clone-mode donor source; default "
+                        "output/splat_<scene>_noinit_pruned.ply relative to "
+                        "--project-root. Deduced from --scene-mesh stem "
+                        "(prefix mesh_ -> splat_) when unset.")
+    p.add_argument("--object-mesh-dir", type=Path, default=None,
+                   help="Clone-mode object mesh root; default "
+                        "output/segmented_<scene>_v9a_fp_v2.")
+    p.add_argument("--donor-inner-m", type=float, default=0.05,
+                   help="Clone-mode donor shell inner radius (metres).")
+    p.add_argument("--donor-outer-m", type=float, default=0.30,
+                   help="Clone-mode donor shell outer radius (metres).")
+    p.add_argument("--donor-y-ceiling-m", type=float, default=0.30,
+                   help="Clone-mode Y ceiling above the LOWEST object-mesh "
+                        "y_min (metres).")
+    p.add_argument("--donor-k", type=int, default=200,
+                   help="Clone-mode K in K-NN.")
+    p.add_argument("--rot-mode", choices=("nearest", "avg"),
+                   default="nearest",
+                   help="Clone-mode rotation strategy.")
     args = p.parse_args()
     if str(args.sam3_cache).strip() == "":
         args.sam3_cache = None
@@ -635,8 +946,35 @@ def main():
     print(f"[init] dp_scale={dp_scale:.5f}, colmap_to_metric=1/{1/colmap_to_metric:.4f}")
     print(f"[init] {len(vs)} views loaded")
 
-    for slug in args.prompts.split(","):
-        slug = slug.strip()
+    # Resolve clone-mode default paths from project_root + scene_mesh stem.
+    if args.mode == "clone":
+        scene_splat = args.scene_splat
+        if scene_splat is None:
+            # Try to derive: <root>/output/splat_<scene>_noinit_pruned.ply
+            # where <scene> is the parent-directory name of scene-mesh.
+            scene_dir = args.scene_mesh.parent.name  # e.g. mesh_v32_data3
+            scene_name = (scene_dir[len("mesh_"):]
+                          if scene_dir.startswith("mesh_") else scene_dir)
+            scene_splat = (args.project_root / "output"
+                           / f"splat_{scene_name}_noinit_pruned.ply")
+            print(f"[init] auto scene-splat = {scene_splat}")
+        else:
+            scene_name = None
+        object_mesh_dir = args.object_mesh_dir
+        if object_mesh_dir is None:
+            if scene_name is None:
+                scene_dir = args.scene_mesh.parent.name
+                scene_name = (scene_dir[len("mesh_"):]
+                              if scene_dir.startswith("mesh_") else scene_dir)
+            object_mesh_dir = (args.project_root / "output"
+                               / f"segmented_{scene_name}_v9a_fp_v2")
+            print(f"[init] auto object-mesh-dir = {object_mesh_dir}")
+    else:
+        scene_splat = None
+        object_mesh_dir = None
+
+    slug_list = [s.strip() for s in args.prompts.split(",") if s.strip()]
+    for slug in slug_list:
         npz = args.unseen_dir / f"unseen_core_{slug}.npz"
         process_object(slug, npz, vs, args.scene_mesh,
                        dp_R, dp_t, dp_scale, colmap_to_metric,
@@ -644,7 +982,16 @@ def main():
                        args.opacity, args.out_dir,
                        sam3_cache=args.sam3_cache,
                        sam3_dilate_px=args.sam3_dilate_px,
-                       topk_views=args.topk_views)
+                       topk_views=args.topk_views,
+                       mode=args.mode,
+                       scene_splat_path=scene_splat,
+                       object_mesh_dir=object_mesh_dir,
+                       all_object_slugs=slug_list,
+                       donor_inner_m=args.donor_inner_m,
+                       donor_outer_m=args.donor_outer_m,
+                       donor_y_ceiling_m=args.donor_y_ceiling_m,
+                       donor_k=args.donor_k,
+                       rot_mode=args.rot_mode)
 
 
 if __name__ == "__main__":
