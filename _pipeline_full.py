@@ -28,11 +28,12 @@ Pipeline stages (in order):
        capped at Y_min + 1 m. Follows the object's real shape (bottle
        neck, overhangs) instead of a coarse XZ silhouette + Y range.
      - MESH: load V32 mesh, bake per-vertex atlas colours, drop any face
-             with ANY vertex inside ANY object volume (any-vertex test),
-             then run PyMeshFix.fill_holes(refine=True) on the whole
-             trimmed mesh. K-NN clone-stamp RGB from the surrounding
-             pre-crop scene verts (K=8, per-channel median, 30 cm donor
-             shell, 2-sigma MAD outlier reject vs the hole ring).
+             with ANY vertex inside ANY object volume (any-vertex test).
+             For each prompt, add a per-object planar mesh patch from
+             the NPZ grid points and colour every patch vertex via K-NN
+             clone (K=200, per-channel median) of scene-mesh donor verts
+             in a 5-30 cm shell around all objects. Small, targeted;
+             mesh grows by ~a few thousand faces per object.
      - SPLAT: start from stage-2 output, drop Gaussians whose CENTER is
               inside any object volume, concatenate the 3 desk patches
               from output/desk_patch_<scene>/desk_patch_<slug>.ply.
@@ -450,6 +451,57 @@ def _build_mesh_patch(grid_points_metric: np.ndarray, grid_shape: tuple,
         rgba = colors
     return trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=rgba,
                            process=False)
+
+
+def _clone_patch_rgb_from_scene(npz_path: Path, scene_mesh,
+                                  predicates: list, k: int = 200,
+                                  donor_shell_inner_m: float = 0.05,
+                                  donor_shell_outer_m: float = 0.30) -> tuple:
+    """K-NN clone patch RGB from surrounding scene-mesh vertices (donor pool),
+    NOT from view-sampled photos. This mirrors the splat-side clone logic:
+    for each NPZ grid point, take K nearest donor verts and use per-channel
+    median RGB. Donors are scene-mesh verts that are (a) outside every
+    object 3D crop (dist > donor_shell_inner_m to all object meshes) AND
+    (b) within donor_shell_outer_m of at least one object.
+
+    Returns (grid_points_metric, rgb01[N,3], grid_shape_xz).
+    """
+    from scipy.spatial import cKDTree
+    data = np.load(npz_path)
+    pts_m = data["grid_points"].astype(np.float64)
+    shape_xz = tuple(int(x) for x in data["shape_xz"])
+
+    # Build the donor mask over scene mesh vertices using the same predicates
+    # semantics as the splat crop. Donors = verts outside all crops but
+    # within the outer shell.
+    verts = np.asarray(scene_mesh.vertices, dtype=np.float64)
+    d_min = np.full(len(verts), np.inf, dtype=np.float64)
+    for pred in predicates:
+        # Reuse the RaycastingScene inside the predicate to get 3D distance
+        import open3d as o3d
+        pts_t = o3d.core.Tensor(verts.astype(np.float32))
+        d = pred["scene"].compute_distance(pts_t).numpy().astype(np.float64)
+        d_min = np.minimum(d_min, d)
+    donor_mask = ((d_min > donor_shell_inner_m)
+                  & (d_min < donor_shell_outer_m))
+    donor_positions = verts[donor_mask]
+
+    if len(donor_positions) == 0:
+        raise RuntimeError(
+            f"No donor scene-mesh verts in shell [{donor_shell_inner_m*100:.1f} "
+            f"cm, {donor_shell_outer_m*100:.1f} cm]; check predicates.")
+
+    vc = np.asarray(scene_mesh.visual.vertex_colors)
+    donor_rgb = vc[donor_mask, :3].astype(np.float64)
+
+    tree = cKDTree(donor_positions)
+    k_eff = min(k, len(donor_positions))
+    _, nn_idx = tree.query(pts_m, k=k_eff)
+    if k_eff == 1:
+        rgb01 = donor_rgb[nn_idx] / 255.0
+    else:
+        rgb01 = np.median(donor_rgb[nn_idx], axis=1) / 255.0
+    return pts_m, rgb01.astype(np.float32), shape_xz
 
 
 def _resample_patch_rgb(npz_path: Path, scene_mesh_path: Path,
@@ -985,32 +1037,41 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
     sam3_cache = project_root / "output" / f"segmented_{scene_name}" / "masks"
     _log(f"    sam3_cache = {sam3_cache}  (exists={sam3_cache.is_dir()})")
 
-    # ---- Clone-fill mesh side: PyMeshFix.fill_holes + K-NN vertex-colour
-    # clone from the pre-crop scene mesh. Replaces the per-prompt planar
-    # patch loop. `_resample_patch_rgb` + `_build_mesh_patch` remain
-    # available as an internal fallback inside `_clone_fill_mesh_hole`.
-    fallback_planar = [
-        (unseen_dir / f"unseen_core_{slug}.npz", slug) for slug in prompts
-    ]
-    combined, n_new_verts, n_patch_faces_total, n_holes_closed = (
-        _clone_fill_mesh_hole(
-            trimmed_mesh=trimmed_mesh,
-            scene_mesh=scene_mesh,
-            predicates=predicates,
-            donor_shell_m=0.30,
-            donor_shell_inner_m=0.00,
-            k=8,
-            outlier_reject_sigma=2.0,
-            y_tolerance_m=(-0.01, 0.05),
-            fallback_planar_patches=fallback_planar,
-            project_root=project_root,
-            scene_name=scene_name,
-            vs=vs,
-            scene_mesh_path=scene_mesh_path,
+    # ---- Mesh fill: per-object planar patch (built from NPZ grid points) +
+    # K-NN clone RGB from surrounding scene-mesh vertices (same clone
+    # semantics as the splat side). The MeshFix.fill_holes(refine=True)
+    # approach was tried but filled every one of ~23,000 boundary loops in
+    # the scene mesh (not just the 3 object holes), adding 513k vertices
+    # scene-wide -> chaotic moth-eaten desk. This approach only touches
+    # the 3 patch regions.
+    import trimesh as _tm
+    mesh_chunks = [trimmed_mesh]
+    n_patch_faces_total = 0
+    for slug in prompts:
+        npz = unseen_dir / f"unseen_core_{slug}.npz"
+        if not npz.exists():
+            _log(f"    [{slug}] no NPZ at {npz}; skipping mesh patch")
+            continue
+        pts_m, rgb01, shape_xz = _clone_patch_rgb_from_scene(
+            npz, scene_mesh, predicates,
+            k=200, donor_shell_inner_m=0.05, donor_shell_outer_m=0.30,
         )
-    )
-    _log(f"    clone-fill: closed {n_holes_closed} holes, added "
-         f"{n_new_verts:,} new verts, {n_patch_faces_total:,} new faces")
+        patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
+        n_patch_faces_total += len(patch_mesh.faces)
+        mesh_chunks.append(patch_mesh)
+        _log(f"    [{slug}] mesh patch: {len(patch_mesh.faces):,} faces, "
+             f"{len(patch_mesh.vertices):,} verts, "
+             f"mean RGB=({int(rgb01[:,0].mean()*255)},"
+             f"{int(rgb01[:,1].mean()*255)},{int(rgb01[:,2].mean()*255)})")
+
+    if len(mesh_chunks) > 1:
+        try:
+            combined = _tm.util.concatenate(mesh_chunks)
+        except Exception as e:
+            _log(f"    WARN concat failed ({e}); saving trimmed only")
+            combined = trimmed_mesh
+    else:
+        combined = trimmed_mesh
 
     out_mesh_path.parent.mkdir(parents=True, exist_ok=True)
     combined.export(str(out_mesh_path))
