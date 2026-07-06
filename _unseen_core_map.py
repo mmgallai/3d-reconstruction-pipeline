@@ -39,6 +39,16 @@ from scene_segmenter.views import V32ViewSource  # noqa: E402
 DEFAULT_GRID_RES_M = 0.005      # 5 mm desk-plane grid
 DEFAULT_DEPTH_TOL_M = 0.015     # 1.5 cm visibility tolerance
 DEFAULT_FOOTPRINT_DILATE_M = 0.02   # 2 cm safety halo around object XZ AABB
+# NOTE (Approach B): _pipeline_full.stage_scene_without_objects
+# OVERWRITES the unseen_core_<slug>.npz written here at pipeline time,
+# replacing grid_points / shape_xz with a predicate-driven irregular
+# footprint (silhouette + crop_dist_m on the fitted desk plane) and
+# adding a `footprint_mask` field. That guarantees the mesh + splat
+# patch match the mesh crop hole exactly (no exposed ring). The
+# visibility analytics produced here (seen_count, heatmap PNG) are
+# still valid as a first-pass on the XZ-AABB grid — they just serve a
+# different purpose (deciding LaMa vs NN-copy) than the pipeline's
+# post-hoc grid, which is authoritative for the patch build.
 
 
 def _build_scene(mesh_path: Path):

@@ -427,22 +427,177 @@ def _drop_faces_inside_any(scene_mesh, predicates: list):
     return trimmed, int(inside_any.sum())
 
 
+def _build_footprint_from_predicate(pred: dict,
+                                     *,
+                                     desk_normal_metric: np.ndarray | None,
+                                     desk_plane_d: float | None,
+                                     desk_y_fallback: float | None,
+                                     extracted_ply: Path,
+                                     crop_dist_m: float = 0.05,
+                                     grid_res: float = 0.005,
+                                     buffer_m: float = 0.10,
+                                     other_predicates: list | None = None,
+                                     ) -> tuple:
+    """Build a patch footprint whose shape follows the 3D-distance crop.
+
+    Approach B (see _pipeline_full docstring / brief):
+      1. Enumerate a regular XZ grid over the extracted mesh's XZ AABB
+         inflated by `buffer_m` (default 10 cm — safely wider than
+         `crop_dist_m` so we can find the shape's outer envelope).
+      2. Project each XZ cell centre onto the fitted desk plane
+         (normal * p + d = 0  =>  y = -(a*x + c*z + d) / b). If no plane
+         is available, fall back to the flat plane y = `desk_y_fallback`.
+      3. Query 3D distance from each candidate point to the object mesh
+         (reusing `pred['scene']`, the RaycastingScene already built for
+         the crop predicate). Keep cells where
+             dist <= crop_dist_m + 0.5 * grid_res
+         AND y <= pred['y_ceiling_m']. The +0.5*grid_res tie-break
+         guarantees we cover the outermost boundary cells the crop's
+         any-vertex-in face drop reached.
+      4. Optional exclusion: if `other_predicates` are provided, cells
+         within `crop_dist_m` of any OTHER object are dropped so two
+         nearby objects never over-patch each other.
+
+    Returns:
+      pts_m         : (N, 3) float64 grid points on the plane (only the
+                      cells kept — irregular set).
+      mask          : (nx, nz) bool of which rectangular grid cells were
+                      kept. Feeds the grid-topology triangulator in
+                      _build_mesh_patch so cell-corner topology is
+                      preserved without needing Delaunay.
+      grid_shape_xz : (nx, nz) enclosing rectangle dimensions.
+      bounds        : (x_min, x_max, z_min, z_max) metric bounds of the
+                      enclosing rectangle (useful for downstream logs
+                      and heatmap regeneration).
+
+    The RaycastingScene inside `pred` is reused — no mesh reload.
+    """
+    import open3d as o3d
+    import trimesh as _tm
+
+    m = _tm.load(str(extracted_ply), force="mesh", process=False)
+    v = np.asarray(m.vertices, dtype=np.float64)
+    x_min = float(v[:, 0].min()) - buffer_m
+    x_max = float(v[:, 0].max()) + buffer_m
+    z_min = float(v[:, 2].min()) - buffer_m
+    z_max = float(v[:, 2].max()) + buffer_m
+
+    xs = np.arange(x_min, x_max + grid_res * 0.5, grid_res)
+    zs = np.arange(z_min, z_max + grid_res * 0.5, grid_res)
+    nx, nz = len(xs), len(zs)
+    gx, gz = np.meshgrid(xs, zs, indexing="ij")
+
+    if (desk_normal_metric is not None and desk_plane_d is not None
+            and abs(float(desk_normal_metric[1])) > 1e-6):
+        a, b, c = (float(desk_normal_metric[0]),
+                   float(desk_normal_metric[1]),
+                   float(desk_normal_metric[2]))
+        gy = -(a * gx + c * gz + float(desk_plane_d)) / b
+    else:
+        y_desk = float(desk_y_fallback) if desk_y_fallback is not None \
+                                        else float(v[:, 1].min())
+        gy = np.full_like(gx, y_desk)
+
+    pts_full = np.stack([gx.flatten(), gy.flatten(), gz.flatten()],
+                        axis=-1).astype(np.float64)
+
+    # Distance query against the object mesh's RaycastingScene.
+    pts_t = o3d.core.Tensor(pts_full.astype(np.float32))
+    d_obj = pred["scene"].compute_distance(pts_t).numpy().astype(np.float64)
+    thresh = float(crop_dist_m) + 0.5 * float(grid_res)
+    # UNION with the object's XZ AABB inflated by crop_dist_m: this
+    # guarantees the patch is at LEAST as wide as the mesh crop's
+    # bounding-box reach. Without this, tall thin objects (bottle) whose
+    # mesh doesn't extend far on the desk plane produced patches that
+    # were 3-12 cm narrower than the crop hole -- the "exposed ring" the
+    # user reported. AABB+crop_dist is a strict superset of the
+    # 3D-distance-based cut for planar-desk cases.
+    x_lo_ab = float(v[:, 0].min()) - float(crop_dist_m)
+    x_hi_ab = float(v[:, 0].max()) + float(crop_dist_m)
+    z_lo_ab = float(v[:, 2].min()) - float(crop_dist_m)
+    z_hi_ab = float(v[:, 2].max()) + float(crop_dist_m)
+    in_aabb = ((pts_full[:, 0] >= x_lo_ab) & (pts_full[:, 0] <= x_hi_ab)
+               & (pts_full[:, 2] >= z_lo_ab) & (pts_full[:, 2] <= z_hi_ab))
+    mask_flat = ((d_obj <= thresh) | in_aabb) & (pts_full[:, 1] <= pred["y_ceiling_m"])
+
+    if other_predicates:
+        for op in other_predicates:
+            d_other = op["scene"].compute_distance(pts_t).numpy().astype(np.float64)
+            excl = (d_other <= float(op["dist_threshold_m"])) \
+                   & (pts_full[:, 1] <= op["y_ceiling_m"])
+            mask_flat &= ~excl
+
+    n_inside = int(mask_flat.sum())
+    ratio = float(n_inside) / max(1, mask_flat.size)
+    if ratio > 0.9:
+        _log(f"    WARN _build_footprint_from_predicate: {ratio*100:.1f}% "
+             f"of candidate cells kept — plane may pass through mesh; "
+             f"footprint degrades to buffered rectangle.")
+
+    mask2d = mask_flat.reshape(nx, nz)
+    pts_m = pts_full[mask_flat]
+    bounds = (x_min, x_max, z_min, z_max)
+    return pts_m, mask2d, (nx, nz), bounds
+
+
 def _build_mesh_patch(grid_points_metric: np.ndarray, grid_shape: tuple,
-                      rgb01: np.ndarray):
-    """Triangulated planar grid on the desk surface with per-vertex RGB."""
+                      rgb01: np.ndarray, mask: np.ndarray | None = None):
+    """Triangulated planar grid on the desk surface with per-vertex RGB.
+
+    Two topology modes:
+
+      * Legacy dense rectangle (`mask is None`):
+        `grid_points_metric` is the full nx*nz grid and every 4-corner
+        cell is triangulated. Preserved for backward-compat.
+
+      * Approach B irregular footprint (`mask is (nx, nz) bool`):
+        `grid_points_metric` is only the cells where `mask` is True
+        (order: row-major flatten of the True cells). We rebuild the
+        vert_id[nx, nz] map, then emit two triangles per cell whose four
+        corners are all inside. Boundary cells missing a corner are
+        skipped — the boundary is jagged at grid_res (5 mm) scale but
+        that's invisible under an object hole and cheaper than Delaunay.
+    """
     import trimesh
     nx, nz = grid_shape
     verts = grid_points_metric.astype(np.float64)
-    tris = []
-    for i in range(nx - 1):
-        for j in range(nz - 1):
-            a = i * nz + j
-            b = (i + 1) * nz + j
-            c = i * nz + (j + 1)
-            d = (i + 1) * nz + (j + 1)
-            tris.append([a, b, d])
-            tris.append([a, d, c])
-    faces = np.asarray(tris, dtype=np.int64)
+
+    if mask is None:
+        # Legacy dense-rectangle path
+        tris = []
+        for i in range(nx - 1):
+            for j in range(nz - 1):
+                a = i * nz + j
+                b = (i + 1) * nz + j
+                c = i * nz + (j + 1)
+                d = (i + 1) * nz + (j + 1)
+                tris.append([a, b, d])
+                tris.append([a, d, c])
+        faces = np.asarray(tris, dtype=np.int64)
+    else:
+        mask2d = np.asarray(mask, dtype=bool).reshape(nx, nz)
+        if int(mask2d.sum()) != len(verts):
+            raise RuntimeError(
+                f"mesh-patch mask/vert mismatch: mask has "
+                f"{int(mask2d.sum())} True cells but got {len(verts)} verts")
+        # Row-major (i, j) True cells map to verts 0..N-1 in the same order
+        # produced by _build_footprint_from_predicate (mask_flat.reshape).
+        vert_id = -np.ones((nx, nz), dtype=np.int64)
+        vert_id[mask2d] = np.arange(len(verts), dtype=np.int64)
+        tris = []
+        for i in range(nx - 1):
+            for j in range(nz - 1):
+                a = vert_id[i, j]
+                b = vert_id[i + 1, j]
+                c = vert_id[i, j + 1]
+                d = vert_id[i + 1, j + 1]
+                if a < 0 or b < 0 or c < 0 or d < 0:
+                    continue  # boundary cell — missing a corner
+                tris.append([a, b, d])
+                tris.append([a, d, c])
+        faces = np.asarray(tris, dtype=np.int64) if tris \
+                else np.zeros((0, 3), dtype=np.int64)
+
     colors = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
     if colors.shape[1] == 3:
         rgba = np.concatenate(
@@ -928,7 +1083,12 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
                                  unseen_dir: Path,
                                  dp_json: Path, bounds_json: Path,
                                  out_mesh_path: Path,
-                                 out_splat_path: Path) -> dict:
+                                 out_splat_path: Path,
+                                 scene_splat_path: Path | None = None,
+                                 crop_dist_m: float = 0.05,
+                                 patch_grid_res_m: float = 0.005,
+                                 patch_aabb_buffer_m: float = 0.10,
+                                 ) -> dict:
     _log("[stage 4] scene without objects (mesh + splat, combined)")
 
     # ----- Build the spatial-crop predicate per prompt -----
@@ -957,16 +1117,172 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
         ply = _require(object_mesh_dir / slug / f"{slug}_extracted.ply",
                        f"extracted obj mesh for {slug}")
         pred = _build_object_distance_predicate(
-            ply, dist_threshold_m=0.05, y_ceiling_offset_m=1.0)
-        _log(f"  [{slug}] object predicate: 3D dist <= 5.0 cm, "
-             f"y_ceiling = {pred['y_ceiling_m']:.3f} m")
+            ply, dist_threshold_m=crop_dist_m, y_ceiling_offset_m=1.0)
+        _log(f"  [{slug}] object predicate: 3D dist <= "
+             f"{crop_dist_m*100:.1f} cm, y_ceiling = "
+             f"{pred['y_ceiling_m']:.3f} m")
         predicates.append(pred)
+
+    # ----- Approach B: rebuild patch footprint from the crop predicate -----
+    # For each slug, compute an irregular XZ grid on the fitted desk plane
+    # whose cells satisfy the SAME distance test used by the mesh-face
+    # `any-vertex-in` crop. This guarantees the mesh patch + splat patch
+    # cover the entire hole (silhouette + crop_dist_m) with no exposed
+    # ring — previously the NPZ used an XZ AABB + 2 cm dilate, which
+    # under-covered a 3D-distance crop at 5 cm by ~3 cm/side. Because
+    # both consumers (mesh patch build + splat clone) read the same NPZ,
+    # updating it once here keeps them locked to a single footprint.
+    #
+    # Additionally, cells within crop_dist_m of ANY OTHER object are
+    # excluded so neighbouring objects that sit <2*crop_dist_m apart do
+    # not over-patch into each other's crop volume.
+    per_slug_footprint = {}
+    _log("  --- rebuilding patch footprints from crop predicate (approach B) ---")
+    for i, slug in enumerate(prompts):
+        ply = object_mesh_dir / slug / f"{slug}_extracted.ply"
+        npz_old = unseen_dir / f"unseen_core_{slug}.npz"
+        # Preserve the fitted plane from the earlier unseen-core-map run.
+        desk_normal_metric = None
+        desk_plane_d = None
+        old_extra_fields = {}
+        y_desk_fallback = None
+        if npz_old.exists():
+            data_old = np.load(npz_old)
+            if "desk_normal_metric" in data_old.files:
+                desk_normal_metric = np.asarray(
+                    data_old["desk_normal_metric"], dtype=np.float64)
+            if "desk_plane_d" in data_old.files:
+                dp_arr = np.asarray(data_old["desk_plane_d"], dtype=np.float64)
+                desk_plane_d = float(dp_arr.flat[0])
+            if "bounds_xyz" in data_old.files:
+                # bounds_xyz is [x_min, x_max, y_desk, z_min, z_max]
+                b_arr = np.asarray(data_old["bounds_xyz"], dtype=np.float64)
+                if b_arr.size >= 3:
+                    y_desk_fallback = float(b_arr[2])
+            # Keep everything except the fields we overwrite.
+            for name in data_old.files:
+                if name not in ("grid_points", "seen_count", "shape_xz",
+                                "bounds_xyz",
+                                "desk_normal_metric", "desk_plane_d",
+                                "footprint_mask"):
+                    old_extra_fields[name] = data_old[name]
+        other_predicates = [predicates[j] for j in range(len(prompts))
+                            if j != i]
+        pts_m, mask2d, (nx, nz), bounds_xz = _build_footprint_from_predicate(
+            predicates[i],
+            desk_normal_metric=desk_normal_metric,
+            desk_plane_d=desk_plane_d,
+            desk_y_fallback=y_desk_fallback,
+            extracted_ply=ply,
+            crop_dist_m=crop_dist_m,
+            grid_res=patch_grid_res_m,
+            buffer_m=patch_aabb_buffer_m,
+            other_predicates=other_predicates,
+        )
+        _log(f"    [{slug}] footprint: enclosing {nx}x{nz} @ "
+             f"{patch_grid_res_m*100:.1f} cm = {nx*nz} candidates -> "
+             f"{len(pts_m)} kept cells "
+             f"(X[{bounds_xz[0]:.3f},{bounds_xz[1]:.3f}] "
+             f"Z[{bounds_xz[2]:.3f},{bounds_xz[3]:.3f}] m); "
+             f"plane={'fitted' if desk_normal_metric is not None else 'flat'}")
+        if len(pts_m) == 0:
+            _log(f"    [{slug}] WARN empty footprint (no cells passed "
+                 f"3D-distance test); skipping NPZ overwrite for this slug")
+            per_slug_footprint.pop(slug, None)
+            continue
+        per_slug_footprint[slug] = {
+            "pts_m": pts_m,
+            "mask2d": mask2d,
+            "shape_xz": (nx, nz),
+            "bounds_xz": bounds_xz,
+            "desk_normal_metric": desk_normal_metric,
+            "desk_plane_d": desk_plane_d,
+            "y_desk_fallback": y_desk_fallback,
+        }
+
+        # Overwrite unseen_core_<slug>.npz so downstream code (splat
+        # clone via _seed_desk_patch and _clone_patch_rgb_from_scene)
+        # sees the new footprint. seen_count for cells that weren't in
+        # the old NPZ defaults to 0 — this only affects the 'views'
+        # colour mode (unused by clone) and analytical heatmaps.
+        unseen_dir.mkdir(parents=True, exist_ok=True)
+        seen_count_new = np.zeros(len(pts_m), dtype=np.int32)
+        x_min, x_max, z_min, z_max = bounds_xz
+        y_desk_for_bounds = y_desk_fallback if y_desk_fallback is not None \
+            else float(pts_m[:, 1].min()) if len(pts_m) else 0.0
+        np_kwargs = dict(
+            grid_points=pts_m.astype(np.float32),
+            seen_count=seen_count_new,
+            shape_xz=np.array((nx, nz), dtype=np.int32),
+            bounds_xyz=np.array([x_min, x_max, y_desk_for_bounds,
+                                 z_min, z_max], dtype=np.float64),
+            footprint_mask=mask2d.flatten().astype(np.bool_),
+        )
+        if desk_normal_metric is not None:
+            np_kwargs["desk_normal_metric"] = desk_normal_metric.astype(
+                np.float64)
+        if desk_plane_d is not None:
+            np_kwargs["desk_plane_d"] = np.array([desk_plane_d],
+                                                  dtype=np.float64)
+        # Preserve unrelated fields (median/summary stats etc.) so the
+        # NPZ remains self-describing for future consumers.
+        for name, arr in old_extra_fields.items():
+            if name not in np_kwargs:
+                np_kwargs[name] = arr
+        np.savez(unseen_dir / f"unseen_core_{slug}.npz", **np_kwargs)
 
     # ===== SPLAT side =====
     _log("  --- splat side ---")
     R, t, dp_scale = _load_dataparser_transform(dp_json)
     bounds = json.loads(bounds_json.read_text())
     colmap_to_metric = 1.0 / float(bounds["scale_factor_da3_to_colmap"])
+
+    # Rebuild each splat patch in-process against the new NPZ so the
+    # splat clone uses the exact same grid as the mesh patch.
+    if scene_splat_path is not None and Path(scene_splat_path).exists():
+        _log(f"  --- rebuilding splat patches from new footprints "
+             f"({patch_splat_dir}) ---")
+        try:
+            from scene_segmenter.views import V32ViewSource
+            vs_for_patch = V32ViewSource(project_root)
+        except Exception as e:
+            _log(f"    WARN V32ViewSource init failed ({e}); "
+                 f"splat patch rebuild may fail if clone mode needs views")
+            vs_for_patch = None
+        import _seed_desk_patch as _sdp
+        patch_splat_dir.mkdir(parents=True, exist_ok=True)
+        for slug in prompts:
+            npz = unseen_dir / f"unseen_core_{slug}.npz"
+            try:
+                _sdp.process_object(
+                    slug=slug,
+                    npz_path=npz,
+                    view_source=vs_for_patch,
+                    scene_mesh_path=scene_mesh_path,
+                    dp_R=R, dp_t=t, dp_scale=dp_scale,
+                    colmap_to_metric=colmap_to_metric,
+                    patch_radius_m=0.004,
+                    normal_radius_m=0.0008,
+                    opacity=0.95,
+                    out_dir=patch_splat_dir,
+                    sam3_cache=None,
+                    mode="clone",
+                    scene_splat_path=scene_splat_path,
+                    object_mesh_dir=object_mesh_dir,
+                    all_object_slugs=list(prompts),
+                    donor_inner_m=0.05,
+                    donor_outer_m=0.30,
+                    donor_y_ceiling_m=0.30,
+                    donor_k=200,
+                    rot_mode="nearest",
+                )
+            except Exception as e:
+                _log(f"    WARN splat patch rebuild for {slug} failed "
+                     f"({e}); falling back to existing "
+                     f"{patch_splat_dir / f'desk_patch_{slug}.ply'}")
+    else:
+        _log(f"  --- scene_splat_path not provided or missing "
+             f"({scene_splat_path}); using pre-existing splat patches ---")
     cleaned_data, _ = _read_ply(cleaned_splat_path)
     n_cleaned = len(cleaned_data)
     pos_splat = np.stack(
@@ -1056,7 +1372,31 @@ def stage_scene_without_objects(*, scene_name: str, project_root: Path,
             npz, scene_mesh, predicates,
             k=200, donor_shell_inner_m=0.05, donor_shell_outer_m=0.30,
         )
-        patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
+        # Approach B: use the predicate-driven mask (built earlier in
+        # this stage) so triangulation follows the actual crop shape.
+        # Falls back to legacy dense-rectangle if the mask isn't
+        # available (e.g. NPZ was authored by an older pipeline).
+        fp = per_slug_footprint.get(slug)
+        if fp is not None and fp["shape_xz"] == shape_xz:
+            patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01,
+                                           mask=fp["mask2d"])
+        else:
+            # NPZ may have stored footprint_mask directly; try that first.
+            data_chk = np.load(npz)
+            if "footprint_mask" in data_chk.files:
+                mask_flat = np.asarray(data_chk["footprint_mask"], dtype=bool)
+                nx_c, nz_c = shape_xz
+                if mask_flat.size == nx_c * nz_c \
+                        and int(mask_flat.sum()) == len(pts_m):
+                    patch_mesh = _build_mesh_patch(
+                        pts_m, shape_xz, rgb01,
+                        mask=mask_flat.reshape(nx_c, nz_c))
+                else:
+                    _log(f"    [{slug}] WARN footprint_mask shape mismatch, "
+                         f"falling back to dense rectangle triangulation")
+                    patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
+            else:
+                patch_mesh = _build_mesh_patch(pts_m, shape_xz, rgb01)
         n_patch_faces_total += len(patch_mesh.faces)
         mesh_chunks.append(patch_mesh)
         _log(f"    [{slug}] mesh patch: {len(patch_mesh.faces):,} faces, "
@@ -1327,6 +1667,7 @@ def main():
         dp_json=dp_json, bounds_json=bounds_json,
         out_mesh_path=out_mesh_no_obj,
         out_splat_path=out_splat_no_obj,
+        scene_splat_path=scene_splat,
     )
 
     # ---- Stage 5: copy scene_full ----
