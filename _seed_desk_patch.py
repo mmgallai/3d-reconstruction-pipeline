@@ -604,7 +604,9 @@ def _clone_gaussian_from_donors(pts_metric_grid: np.ndarray,
                                 donor_mask: np.ndarray,
                                 donor_centres_metric: np.ndarray,
                                 k: int = 8,
-                                rot_mode: str = "nearest") -> np.ndarray:
+                                rot_mode: str = "nearest",
+                                scale_floor_mm: float = 3.5,
+                                metric_to_splat: float = 1.0) -> np.ndarray:
     """K-NN clone-stamp Gaussian properties from `scene_arr` donors onto each
     grid point. Returns (P, F) rows in the same column order as scene_arr.
 
@@ -652,9 +654,18 @@ def _clone_gaussian_from_donors(pts_metric_grid: np.ndarray,
     sh_stack = scene_arr[nn][:, :, sh_cols]           # (P, K, 48)
     out[:, sh_cols] = np.median(sh_stack, axis=1).astype(np.float32)
 
-    # Scale: per-axis median in log space
+    # Scale: per-axis median in log space, then enforce a per-axis metric
+    # sigma floor so patch Gaussians reliably fill the NPZ grid spacing.
+    # Cloned Gaussians from small-detail donors (~2 mm sigma) leave visible
+    # dots between 5 mm grid points; a 3.5 mm sigma floor gives 2-sigma
+    # coverage of 7 mm, comfortably overlapping consecutive grid neighbours.
     sc_stack = scene_arr[nn][:, :, scale_cols]        # (P, K, 3)
-    out[:, scale_cols] = np.median(sc_stack, axis=1).astype(np.float32)
+    scale_log_med = np.median(sc_stack, axis=1).astype(np.float32)  # (P, 3)
+    if scale_floor_mm > 0 and metric_to_splat > 0:
+        floor_sigma_splat = (scale_floor_mm * 0.001) * metric_to_splat
+        floor_log = float(np.log(floor_sigma_splat))
+        scale_log_med = np.maximum(scale_log_med, floor_log)
+    out[:, scale_cols] = scale_log_med
 
     # Opacity: median in logit space
     op_stack = scene_arr[nn][:, :, op_col]            # (P, K)
@@ -718,7 +729,8 @@ def process_object(slug: str, npz_path: Path, view_source,
                    donor_outer_m: float = 0.30,
                    donor_y_ceiling_m: float = 0.05,
                    donor_k: int = 200,
-                   rot_mode: str = "nearest"):
+                   rot_mode: str = "nearest",
+                   scale_floor_mm: float = 3.5):
     print(f"\n=== {slug}  [mode={mode}] ===")
     if not npz_path.exists():
         print(f"  missing {npz_path}; run _unseen_core_map.py first")
@@ -799,6 +811,7 @@ def process_object(slug: str, npz_path: Path, view_source,
 
         print(f"    K-NN clone (K={donor_k}, rot_mode={rot_mode}) "
               f"for {n_total} grid points ...")
+        metric_to_splat_scalar = dp_scale / colmap_to_metric
         rows = _clone_gaussian_from_donors(
             pts_metric_grid=pts_m,
             pts_splat_grid=pts_s,
@@ -808,6 +821,8 @@ def process_object(slug: str, npz_path: Path, view_source,
             donor_centres_metric=scene_centres_m,
             k=donor_k,
             rot_mode=rot_mode,
+            scale_floor_mm=scale_floor_mm,
+            metric_to_splat=metric_to_splat_scalar,
         )
         out_path = out_dir / f"desk_patch_{slug}.ply"
         _build_clone_patch_ply(rows, prop_names, out_path)
@@ -933,6 +948,12 @@ def main():
     p.add_argument("--rot-mode", choices=("nearest", "avg"),
                    default="nearest",
                    help="Clone-mode rotation strategy.")
+    p.add_argument("--patch-scale-floor-mm", type=float, default=3.5,
+                   help="Clone-mode per-axis metric sigma floor for patch "
+                        "Gaussians in mm. Prevents visible dot-grid patterns "
+                        "when donors are small-detail Gaussians. Default 3.5 "
+                        "mm gives 2-sigma coverage of 7 mm (comfortably "
+                        "overlapping 5 mm NPZ grid spacing).")
     args = p.parse_args()
     if str(args.sam3_cache).strip() == "":
         args.sam3_cache = None
@@ -991,7 +1012,8 @@ def main():
                        donor_outer_m=args.donor_outer_m,
                        donor_y_ceiling_m=args.donor_y_ceiling_m,
                        donor_k=args.donor_k,
-                       rot_mode=args.rot_mode)
+                       rot_mode=args.rot_mode,
+                       scale_floor_mm=args.patch_scale_floor_mm)
 
 
 if __name__ == "__main__":
