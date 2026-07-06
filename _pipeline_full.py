@@ -505,17 +505,19 @@ def _build_footprint_from_predicate(pred: dict,
     pts_t = o3d.core.Tensor(pts_full.astype(np.float32))
     d_obj = pred["scene"].compute_distance(pts_t).numpy().astype(np.float64)
     thresh = float(crop_dist_m) + 0.5 * float(grid_res)
-    # UNION with the object's XZ AABB inflated by crop_dist_m: this
-    # guarantees the patch is at LEAST as wide as the mesh crop's
-    # bounding-box reach. Without this, tall thin objects (bottle) whose
-    # mesh doesn't extend far on the desk plane produced patches that
-    # were 3-12 cm narrower than the crop hole -- the "exposed ring" the
-    # user reported. AABB+crop_dist is a strict superset of the
-    # 3D-distance-based cut for planar-desk cases.
-    x_lo_ab = float(v[:, 0].min()) - float(crop_dist_m)
-    x_hi_ab = float(v[:, 0].max()) + float(crop_dist_m)
-    z_lo_ab = float(v[:, 2].min()) - float(crop_dist_m)
-    z_hi_ab = float(v[:, 2].max()) + float(crop_dist_m)
+    # UNION with the object's XZ AABB inflated by crop_dist_m + safety
+    # margin: this guarantees the patch is at LEAST as wide as the mesh
+    # crop's bounding-box reach, with a small buffer for any-vertex-in
+    # face drops that extend slightly past the 5 cm centre-distance test.
+    # Without this, tall thin objects (bottle) whose mesh doesn't extend
+    # far on the desk plane produced patches that were 3-12 cm narrower
+    # than the crop hole. The +2 cm safety pad covers the residual tiny
+    # gaps observed on v7b.
+    aabb_pad_m = float(crop_dist_m) + 0.02
+    x_lo_ab = float(v[:, 0].min()) - aabb_pad_m
+    x_hi_ab = float(v[:, 0].max()) + aabb_pad_m
+    z_lo_ab = float(v[:, 2].min()) - aabb_pad_m
+    z_hi_ab = float(v[:, 2].max()) + aabb_pad_m
     in_aabb = ((pts_full[:, 0] >= x_lo_ab) & (pts_full[:, 0] <= x_hi_ab)
                & (pts_full[:, 2] >= z_lo_ab) & (pts_full[:, 2] <= z_hi_ab))
     mask_flat = ((d_obj <= thresh) | in_aabb) & (pts_full[:, 1] <= pred["y_ceiling_m"])
