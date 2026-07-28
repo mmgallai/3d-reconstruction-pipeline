@@ -57,3 +57,19 @@ reconstruct_v*.err.log
 Log/
 colmap_iphone_backup/
 *.whl
+
+# === Added 2026-07-28 ===
+# Backup workspace snapshots (colmap/, nerfstudio/, nerfstudio_data/ get
+# rotated between scene runs)
+colmap.bak*/
+colmap.room_*_saved_*/
+nerfstudio.bak*/
+nerfstudio.room_*/
+nerfstudio_data.*/
+nerfstudio_data_*/
+nerfstudio_data*.zip
+openmvs_v*_old/
+# Stub HEIC scan dirs used to bypass the pipeline's HEIC precondition
+_stub_heic_scan_*/
+# Scratch outputs
+scratch_*.ply

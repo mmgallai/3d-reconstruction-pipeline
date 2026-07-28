@@ -477,10 +477,16 @@ def _build_footprint_from_predicate(pred: dict,
 
     m = _tm.load(str(extracted_ply), force="mesh", process=False)
     v = np.asarray(m.vertices, dtype=np.float64)
-    x_min = float(v[:, 0].min()) - buffer_m
-    x_max = float(v[:, 0].max()) + buffer_m
-    z_min = float(v[:, 2].min()) - buffer_m
-    z_max = float(v[:, 2].max()) + buffer_m
+    # Search rectangle must be at least as wide as the crop reach + AABB
+    # safety pad; otherwise the union-with-AABB step below is silently
+    # clipped and the patch ends up narrower than the mesh crop -> visible
+    # holes beside removed objects. Bump buffer_m to accommodate large
+    # crop_dist_m values.
+    effective_buffer_m = max(float(buffer_m), float(crop_dist_m) + 0.04)
+    x_min = float(v[:, 0].min()) - effective_buffer_m
+    x_max = float(v[:, 0].max()) + effective_buffer_m
+    z_min = float(v[:, 2].min()) - effective_buffer_m
+    z_max = float(v[:, 2].max()) + effective_buffer_m
 
     xs = np.arange(x_min, x_max + grid_res * 0.5, grid_res)
     zs = np.arange(z_min, z_max + grid_res * 0.5, grid_res)
@@ -1551,6 +1557,13 @@ def main():
                          "= 20 cm)")
     ap.add_argument("--out-root", type=Path,
                     default=Path("output/pipeline_v32_test_run"))
+    ap.add_argument("--crop-dist-m", type=float, default=0.05,
+                    help="3D distance from each extracted object mesh "
+                         "at which the crop cuts. Default 0.05 m works "
+                         "for well-segmented objects (V32). Larger "
+                         "values (0.10-0.15) help for complex objects "
+                         "whose SAM3 mask + extracted mesh miss parts "
+                         "(plant leaves, box tops, thin edges).")
     # Optional input overrides (sensible defaults wired for V32)
     ap.add_argument("--scene-splat", type=Path, default=None,
                     help="default: output/splat_<scene>_noinit_pruned.ply")
@@ -1670,6 +1683,7 @@ def main():
         out_mesh_path=out_mesh_no_obj,
         out_splat_path=out_splat_no_obj,
         scene_splat_path=scene_splat,
+        crop_dist_m=args.crop_dist_m,
     )
 
     # ---- Stage 5: copy scene_full ----
