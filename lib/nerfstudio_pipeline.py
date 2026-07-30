@@ -228,7 +228,22 @@ def train_nerfstudio_format(
     else:
         extra_model_args = '  --pipeline.model.cull-alpha-thresh 0.01 '
         install_cmd = ""
-        
+
+    # Full-quality run: at native resolution (--downscale-factor 1) with 311+ high-res
+    # images, the default cache-images=gpu behavior eats 6-10 GB of VRAM just for the
+    # image cache. When training at native, offload images to CPU RAM so we still fit
+    # on a 16 GB card. Also stop densification a bit earlier (12k of 30k iters, default
+    # is 15k) to keep Gaussian growth in check — the existing --cull-alpha-thresh 0.01
+    # already does most of the work.
+    #
+    # NOTE: nerfstudio 1.1.5 (the version in nerfstudio-blackwell) does NOT have a
+    # --pipeline.model.max-gauss-num flag; density is controlled indirectly via
+    # cull-alpha-thresh + stop-split-at.
+    if scale == 1 and not (is_dn or is_tof):
+        extra_model_args += '  --pipeline.datamanager.cache-images cpu '
+        extra_model_args += '  --pipeline.model.stop-split-at 12000 '
+        logger.info("Full-quality mode (scale=1): +cache-images=cpu, +stop-split-at=12000")
+
     dataparser_args = f'  --downscale-factor {scale}'
     if is_dn or is_tof:
         # Our sensor depth maps are float32 metres; override the default 0.001 (mm convention)
