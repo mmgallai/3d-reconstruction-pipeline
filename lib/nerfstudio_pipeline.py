@@ -160,6 +160,16 @@ def resume_training(project_root: Path, data_rel: str = "colmap/dense") -> None:
 
     logger.info(f"=== Resuming training from step {step} ({ckpt_dir_rel}) ===")
     write_patch_file(project_root)
+    # Mirror the VRAM-fit flags used at scale=1 in train_nerfstudio_format —
+    # without these, resuming a native-res run would try to cache all images
+    # in GPU VRAM and OOM on a 16 GB card.
+    extra_resume_args = ''
+    if scale == 1:
+        extra_resume_args = (
+            '  --pipeline.datamanager.cache-images cpu '
+            '  --pipeline.model.stop-split-at 12000 '
+        )
+        logger.info("Full-quality resume (scale=1): +cache-images=cpu, +stop-split-at=12000")
     cmd = (
         f'docker run --rm --gpus all -v {_vol(project_root)} '
         f'-e TORCH_HOME=/workspace/torch_cache '
@@ -171,6 +181,7 @@ def resume_training(project_root: Path, data_rel: str = "colmap/dense") -> None:
         f'  --output-dir /workspace/nerfstudio '
         f'  --vis tensorboard '
         f'  --max-num-iterations {iters} '
+        f'{extra_resume_args}'
         f'  nerfstudio-data '
         f'  --downscale-factor {scale}'
         f'"'
