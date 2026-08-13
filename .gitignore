@@ -73,3 +73,9 @@ openmvs_v*_old/
 _stub_heic_scan_*/
 # Scratch outputs
 scratch_*.ply
+
+# === Backup / stash dirs auto-created by pipeline scripts (large, transient) ===
+colmap.*_stash_*/
+nerfstudio.*_stash_*/
+colmap.*_saved_*/
+nerfstudio.*_saved_*/
